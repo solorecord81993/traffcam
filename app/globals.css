@@ -369,6 +369,11 @@ button:focus-visible {
   transform: scale(0.985);
 }
 
+.resume-button:disabled {
+  cursor: wait;
+  opacity: 0.75;
+}
+
 .resume-cancel {
   padding: 5px 10px;
   border: 0;

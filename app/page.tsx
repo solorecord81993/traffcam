@@ -93,6 +93,7 @@ type StopCameraOptions = {
 
 const VISION_SESSION_KEY = "roadguard-vision-session-v3";
 const VISION_SESSION_MAX_AGE = 4 * 60 * 60 * 1000;
+const CAMERA_REQUEST_TIMEOUT = 15000;
 const DEFAULT_RUNTIME_PROFILE: RuntimeProfile = {
   ios: false,
   recovery: false,
@@ -312,7 +313,7 @@ async function requestCameraStream(
   deviceId?: string,
 ) {
   try {
-    return await navigator.mediaDevices.getUserMedia({
+    return await getUserMediaWithTimeout({
       audio: false,
       video: cameraConstraints(profile, deviceId),
     });
@@ -333,11 +334,46 @@ async function requestCameraStream(
         "TrackStartError",
       ].includes(name);
     if (!canRetryWithoutStoredDevice) throw error;
-    return navigator.mediaDevices.getUserMedia({
+    return getUserMediaWithTimeout({
       audio: false,
       video: cameraConstraints(profile),
     });
   }
+}
+
+function getUserMediaWithTimeout(
+  constraints: MediaStreamConstraints,
+) {
+  return new Promise<MediaStream>((resolve, reject) => {
+    let settled = false;
+    const timer = window.setTimeout(() => {
+      settled = true;
+      reject(
+        new DOMException(
+          "Safari did not answer the camera request",
+          "TimeoutError",
+        ),
+      );
+    }, CAMERA_REQUEST_TIMEOUT);
+
+    void navigator.mediaDevices.getUserMedia(constraints).then(
+      (stream) => {
+        if (settled) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        settled = true;
+        window.clearTimeout(timer);
+        resolve(stream);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 function visionFrameSize(
@@ -1201,6 +1237,10 @@ export default function Home() {
       } catch (error) {
         console.error(error);
         if (options.resume) {
+          const errorName =
+            error && typeof error === "object" && "name" in error
+              ? String(error.name)
+              : "";
           stopCamera({ clearSession: false, resetUi: false });
           saveVisionSession(
             modeRef.current,
@@ -1208,7 +1248,13 @@ export default function Home() {
             false,
           );
           setErrorMessage(
-            "Safari ต้องให้แตะหน้าจอหนึ่งครั้งเพื่อเปิดกล้องต่อ",
+            ["NotAllowedError", "PermissionDeniedError"].includes(
+              errorName,
+            )
+              ? "สิทธิ์กล้องถูกปิด กรุณาอนุญาต Camera ให้เว็บไซต์นี้ใน Safari แล้วแตะอีกครั้ง"
+              : errorName === "TimeoutError"
+                ? "Safari ไม่ตอบคำขอกล้องภายใน 15 วินาที แตะเพื่อลองขอสิทธิ์ใหม่"
+                : "Safari ต้องให้แตะหน้าจอหนึ่งครั้งเพื่อเปิดกล้องต่อ",
           );
           setCameraState("paused");
         } else {
@@ -1239,7 +1285,10 @@ export default function Home() {
   }, [cameraIndex, cameras, startCamera]);
 
   const resumeCamera = useCallback(async () => {
-    if (resumeInFlightRef.current) return;
+    if (resumeInFlightRef.current) {
+      cameraSessionRef.current += 1;
+      resumeInFlightRef.current = false;
+    }
     resumeInFlightRef.current = true;
     try {
       await startCamera(activeDeviceIdRef.current, {
@@ -1330,6 +1379,20 @@ export default function Home() {
       }
     }
 
+    if (isIOSDevice()) {
+      stopCamera({ clearSession: false, resetUi: false });
+      saveVisionSession(
+        modeRef.current,
+        activeDeviceIdRef.current,
+        false,
+      );
+      setErrorMessage(
+        "แตะปุ่มด้านล่างเพื่อให้ Safari เปิดกล้องอีกครั้ง",
+      );
+      setCameraState("paused");
+      return;
+    }
+
     resumeInFlightRef.current = true;
     try {
       await startCamera(activeDeviceIdRef.current, {
@@ -1339,7 +1402,7 @@ export default function Home() {
     } finally {
       resumeInFlightRef.current = false;
     }
-  }, [loadYolo, requestWakeLock, startCamera]);
+  }, [loadYolo, requestWakeLock, startCamera, stopCamera]);
 
   useEffect(() => {
     const onVisibilityChange = () => {
@@ -1399,8 +1462,15 @@ export default function Home() {
       recoveryCheckedRef.current = true;
       modeRef.current = stored.mode;
       setMode(stored.mode);
-      setCameraState("resuming");
       setSessionChecked(true);
+      if (isIOSDevice()) {
+        setErrorMessage(
+          "แตะปุ่มเพื่อเปิดกล้องและอนุญาตให้ Safari ทำงานต่อ",
+        );
+        setCameraState("paused");
+        return;
+      }
+      setCameraState("resuming");
       resumeInFlightRef.current = true;
       void startCamera(stored.deviceId, {
         resume: true,
@@ -1635,36 +1705,56 @@ export default function Home() {
         </section>
       )}
 
-      {cameraState === "paused" && (
+      {(cameraState === "paused" || cameraState === "resuming") && (
         <section className="resume-panel" role="alert">
           <span className="resume-icon">
-            <RefreshCw size={27} />
+            {cameraState === "resuming" ? (
+              <LoaderCircle className="spin" size={27} />
+            ) : (
+              <Camera size={27} />
+            )}
           </span>
           <div>
-            <strong>Safari พักการทำงานของกล้อง</strong>
+            <strong>
+              {cameraState === "resuming"
+                ? "กำลังขอสิทธิ์กล้อง"
+                : "แตะเพื่อเปิดกล้องต่อ"}
+            </strong>
             <p>
-              ระบบจำโหมดเดิมไว้แล้ว แตะหนึ่งครั้งเพื่อทำงานต่อในโหมดประหยัดหน่วยความจำ
+              {cameraState === "resuming"
+                ? "ตอบรับหน้าต่าง Camera ของ Safari หากไม่ขึ้น ระบบจะกลับมาให้ลองใหม่อัตโนมัติ"
+                : errorMessage ||
+                  "ระบบจำโหมดเดิมไว้แล้ว Safari ต้องได้รับการแตะจากคุณก่อนจึงจะเปิดกล้องได้"}
             </p>
           </div>
           <button
             className="resume-button"
             type="button"
             onClick={() => void resumeCamera()}
+            disabled={cameraState === "resuming"}
           >
-            <Camera size={20} />
-            เปิดกล้องต่อ
+            {cameraState === "resuming" ? (
+              <LoaderCircle className="spin" size={20} />
+            ) : (
+              <Camera size={20} />
+            )}
+            {cameraState === "resuming"
+              ? "กำลังรอ Safari…"
+              : "เปิดกล้องและอนุญาต"}
           </button>
-          <button
-            className="resume-cancel"
-            type="button"
-            onClick={cancelResume}
-          >
-            กลับหน้าเริ่มต้น
-          </button>
+          {cameraState === "paused" && (
+            <button
+              className="resume-cancel"
+              type="button"
+              onClick={cancelResume}
+            >
+              กลับหน้าเริ่มต้น
+            </button>
+          )}
         </section>
       )}
 
-      {isRunning && cameraState !== "paused" && (
+      {cameraState === "running" && (
         <>
           <div
             className={`mode-badge gps-${gpsState}`}
