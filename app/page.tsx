@@ -26,7 +26,7 @@ import {
   type GeoFix,
 } from "./motion";
 import {
-  analyzeRoadScene,
+  analyzeRoadSceneScaled,
   createRoadSceneTracker,
   emptyRoadScene,
   type RoadScene,
@@ -51,6 +51,33 @@ type GpsState =
   | "weak"
   | "denied"
   | "unsupported";
+
+type RuntimeProfile = {
+  ios: boolean;
+  recovery: boolean;
+  modelDevice: "auto" | "cpu";
+  inputMax: number;
+  roadMax: number;
+  roadIntervalMoving: number;
+  roadIntervalStopped: number;
+  overlayInterval: number;
+  inferenceMovingCooldown: number;
+  inferenceStoppedCooldown: number;
+};
+
+const VISION_SESSION_KEY = "roadguard-vision-session-v3";
+const DEFAULT_RUNTIME_PROFILE: RuntimeProfile = {
+  ios: false,
+  recovery: false,
+  modelDevice: "auto",
+  inputMax: 512,
+  roadMax: 272,
+  roadIntervalMoving: 420,
+  roadIntervalStopped: 700,
+  overlayInterval: 50,
+  inferenceMovingCooldown: 120,
+  inferenceStoppedCooldown: 360,
+};
 
 const ROAD_CLASS_IDS = [
   0, 1, 2, 3, 5, 6, 7, 9, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
@@ -91,60 +118,129 @@ function ModeIcon({ mode, size = 21 }: { mode: TravelMode; size?: number }) {
   return <Icon aria-hidden="true" size={size} strokeWidth={2.2} />;
 }
 
-function concatenateChunks(chunks: Uint8Array[], totalBytes: number) {
-  const output = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    output.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return output;
-}
-
 function captureOrientation() {
   return window.innerHeight >= window.innerWidth
     ? ("portrait" as const)
     : ("landscape" as const);
 }
 
-function captureShape(
-  orientation: "portrait" | "landscape",
-): MediaTrackConstraints {
-  const portrait = orientation === "portrait";
-  return {
-    width: {
-      ideal: portrait ? 720 : 1280,
-      max: portrait ? 720 : 1280,
-    },
-    height: {
-      ideal: portrait ? 1280 : 720,
-      max: portrait ? 1280 : 720,
-    },
-    aspectRatio: { ideal: portrait ? 9 / 16 : 16 / 9 },
-    frameRate: { ideal: 24, max: 30 },
-  };
-}
-
 function cameraConstraints(
-  orientation: "portrait" | "landscape",
   deviceId?: string,
 ): MediaTrackConstraints {
   return {
-    ...captureShape(orientation),
+    width: { ideal: 1280, max: 1280 },
+    frameRate: { ideal: 20, max: 24 },
     ...(deviceId
       ? { deviceId: { exact: deviceId } }
       : { facingMode: { ideal: "environment" } }),
   };
 }
 
+function isIOSDevice() {
+  return (
+    /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+  );
+}
+
+function hadUncleanVisionSession() {
+  try {
+    const raw = window.localStorage.getItem(VISION_SESSION_KEY);
+    if (!raw) return false;
+    const { at } = JSON.parse(raw) as { at?: number };
+    return typeof at === "number" && Date.now() - at < 4 * 60 * 60 * 1000;
+  } catch {
+    return false;
+  }
+}
+
+function markVisionSession(active: boolean) {
+  try {
+    if (active) {
+      window.localStorage.setItem(
+        VISION_SESSION_KEY,
+        JSON.stringify({ at: Date.now() }),
+      );
+    } else {
+      window.localStorage.removeItem(VISION_SESSION_KEY);
+    }
+  } catch {
+    // Private browsing or storage policies can disable localStorage.
+  }
+}
+
+function selectRuntimeProfile(recovery: boolean): RuntimeProfile {
+  if (!isIOSDevice()) return DEFAULT_RUNTIME_PROFILE;
+  if (recovery) {
+    return {
+      ios: true,
+      recovery: true,
+      modelDevice: "cpu",
+      inputMax: 320,
+      roadMax: 224,
+      roadIntervalMoving: 820,
+      roadIntervalStopped: 1100,
+      overlayInterval: 90,
+      inferenceMovingCooldown: 850,
+      inferenceStoppedCooldown: 1250,
+    };
+  }
+  return {
+    ios: true,
+    recovery: false,
+    modelDevice: "auto",
+    inputMax: 384,
+    roadMax: 256,
+    roadIntervalMoving: 560,
+    roadIntervalStopped: 820,
+    overlayInterval: 66,
+    inferenceMovingCooldown: 460,
+    inferenceStoppedCooldown: 760,
+  };
+}
+
+function visionFrameSize(
+  sourceWidth: number,
+  sourceHeight: number,
+  maxDimension: number,
+) {
+  const scale = Math.min(
+    1,
+    maxDimension / Math.max(sourceWidth, sourceHeight),
+  );
+  return {
+    width: Math.max(1, Math.round(sourceWidth * scale)),
+    height: Math.max(1, Math.round(sourceHeight * scale)),
+  };
+}
+
+async function resetCameraZoom(track: MediaStreamTrack) {
+  try {
+    const capabilities = track.getCapabilities() as MediaTrackCapabilities & {
+      zoom?: { min: number; max: number; step?: number };
+    };
+    if (!capabilities.zoom) return;
+    const zoom = Math.min(
+      capabilities.zoom.max,
+      Math.max(capabilities.zoom.min, 1),
+    );
+    const zoomConstraint = { zoom } as unknown as MediaTrackConstraintSet;
+    await track.applyConstraints({ advanced: [zoomConstraint] });
+  } catch {
+    // Some iOS camera drivers advertise zoom but reject web constraints.
+  }
+}
+
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const inferenceCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const roadCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animationRef = useRef<number | null>(null);
   const geolocationWatchRef = useRef<number | null>(null);
+  const visionHeartbeatRef = useRef<ReturnType<typeof setInterval> | null>(
+    null,
+  );
   const wakeLockRef = useRef<{ release: () => Promise<void> } | null>(null);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const modelRef = useRef<YoloModel | null>(null);
@@ -154,6 +250,7 @@ export default function Home() {
   const modeRef = useRef<TravelMode>("drive");
   const soundEnabledRef = useRef(true);
   const inferenceBusyRef = useRef(false);
+  const inferenceErrorCountRef = useRef(0);
   const lastInferenceAtRef = useRef(0);
   const lastOverlayAtRef = useRef(0);
   const lastRoadAnalysisAtRef = useRef(0);
@@ -182,12 +279,17 @@ export default function Home() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const lastAudioAlertRef = useRef({ key: "", level: "", at: 0 });
   const statsRef = useRef({ startedAt: 0, frames: 0 });
+  const runtimeProfileRef = useRef<RuntimeProfile>(
+    DEFAULT_RUNTIME_PROFILE,
+  );
+  const recoveryCheckedRef = useRef<boolean | null>(null);
 
   const [mode, setMode] = useState<TravelMode>("drive");
   const [cameraState, setCameraState] = useState<CameraState>("idle");
   const [modelState, setModelState] = useState<ModelState>("idle");
   const [modelProgress, setModelProgress] = useState(0);
   const [modelBackend, setModelBackend] = useState("");
+  const [runtimeLabel, setRuntimeLabel] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
   const [modelError, setModelError] = useState("");
   const [soundEnabled, setSoundEnabled] = useState(true);
@@ -347,32 +449,19 @@ export default function Home() {
         const response = await fetch("/models/yolo26n.onnx", {
           cache: "force-cache",
         });
-        if (!response.ok || !response.body) {
+        if (!response.ok) {
           throw new Error(`ดาวน์โหลดโมเดลไม่สำเร็จ (${response.status})`);
         }
 
-        const total = Number(response.headers.get("content-length") ?? 0);
-        const reader = response.body.getReader();
-        const chunks: Uint8Array[] = [];
-        let received = 0;
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          if (!value) continue;
-          chunks.push(value);
-          received += value.byteLength;
-          const progress = total
-            ? Math.round((received / total) * 76)
-            : Math.min(76, 8 + Math.round(received / 220_000));
-          setModelProgress(Math.max(3, Math.min(76, progress)));
-        }
-
-        if (!received) throw new Error("ไฟล์โมเดลว่างเปล่า");
+        setModelProgress(24);
+        const modelBytes = new Uint8Array(await response.arrayBuffer());
+        if (!modelBytes.byteLength) throw new Error("ไฟล์โมเดลว่างเปล่า");
         setModelProgress(82);
-        const modelBytes = concatenateChunks(chunks, received);
         const { YOLO } = await import("@ultralytics/yolo");
         setModelProgress(91);
-        const model = await YOLO.load(modelBytes, { device: "auto" });
+        const model = await YOLO.load(modelBytes, {
+          device: runtimeProfileRef.current.modelDevice,
+        });
         modelRef.current = model;
         setModelBackend(model.device);
         setModelProgress(100);
@@ -486,6 +575,11 @@ export default function Home() {
   const stopCamera = useCallback(() => {
     runningRef.current = false;
     cameraSessionRef.current += 1;
+    if (visionHeartbeatRef.current) {
+      clearInterval(visionHeartbeatRef.current);
+      visionHeartbeatRef.current = null;
+    }
+    markVisionSession(false);
     if (animationRef.current) cancelAnimationFrame(animationRef.current);
     animationRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -497,76 +591,69 @@ export default function Home() {
     roadSceneRef.current = emptyRoadScene();
     roadSceneTrackerRef.current = createRoadSceneTracker();
     frameSizeRef.current = { width: 0, height: 0 };
+    inferenceErrorCountRef.current = 0;
+    statsRef.current = { startedAt: 0, frames: 0 };
     alertRef.current = null;
     alertHoldRef.current = { alert: null, lastSeenAt: 0 };
     trackStoreRef.current = { nextId: 1, tracks: new Map() };
     setAlert(null);
     setDetectedCount(0);
     setFps(0);
+    setCameraState("idle");
   }, [stopLocationTracking]);
 
-  const analyzeCurrentRoad = useCallback((analyzedAt: number) => {
+  const captureCurrentFrame = useCallback(() => {
     const video = videoRef.current;
     if (
-      modeRef.current !== "drive" ||
       !video ||
       video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
       !video.videoWidth ||
       !video.videoHeight
     ) {
-      roadSceneRef.current = emptyRoadScene(analyzedAt);
-      roadSceneTrackerRef.current = createRoadSceneTracker();
-      return;
+      return null;
     }
 
-    try {
-      const analysisCanvas =
-        roadCanvasRef.current ?? document.createElement("canvas");
-      roadCanvasRef.current = analysisCanvas;
-      const scale = Math.min(
-        1,
-        320 / Math.max(video.videoWidth, video.videoHeight),
-      );
-      const width = Math.max(96, Math.round(video.videoWidth * scale));
-      const height = Math.max(96, Math.round(video.videoHeight * scale));
-      if (
-        analysisCanvas.width !== width ||
-        analysisCanvas.height !== height
-      ) {
-        analysisCanvas.width = width;
-        analysisCanvas.height = height;
-        roadSceneTrackerRef.current = createRoadSceneTracker();
-      }
-      const context = analysisCanvas.getContext("2d", {
-        alpha: false,
-        willReadFrequently: true,
-      });
-      if (!context) return;
-      context.drawImage(video, 0, 0, width, height);
-      const frame = context.getImageData(0, 0, width, height);
-      roadSceneRef.current = analyzeRoadScene(
-        frame.data,
-        width,
-        height,
-        roadSceneTrackerRef.current,
-        analyzedAt,
-      );
-    } catch (error) {
-      console.warn("Road scene analysis failed", error);
-      roadSceneRef.current = emptyRoadScene(analyzedAt);
-      roadSceneTrackerRef.current = createRoadSceneTracker();
+    const dimensions = visionFrameSize(
+      video.videoWidth,
+      video.videoHeight,
+      runtimeProfileRef.current.inputMax,
+    );
+    const inferenceCanvas =
+      inferenceCanvasRef.current ?? document.createElement("canvas");
+    inferenceCanvasRef.current = inferenceCanvas;
+    if (
+      inferenceCanvas.width !== dimensions.width ||
+      inferenceCanvas.height !== dimensions.height
+    ) {
+      inferenceCanvas.width = dimensions.width;
+      inferenceCanvas.height = dimensions.height;
     }
+    const context = inferenceCanvas.getContext("2d", {
+      alpha: false,
+      willReadFrequently: true,
+    });
+    if (!context) return null;
+    context.drawImage(
+      video,
+      0,
+      0,
+      dimensions.width,
+      dimensions.height,
+    );
+    return context.getImageData(
+      0,
+      0,
+      dimensions.width,
+      dimensions.height,
+    );
   }, []);
 
   const runInference = useCallback(
-    async (session: number) => {
+    async (session: number, frame: ImageData) => {
       const model = modelRef.current;
-      const video = videoRef.current;
       if (
         !model ||
-        !video ||
         inferenceBusyRef.current ||
-        video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
         document.hidden
       ) {
         return;
@@ -575,41 +662,7 @@ export default function Home() {
       inferenceBusyRef.current = true;
       const startedAt = performance.now();
       try {
-        const inferenceCanvas =
-          inferenceCanvasRef.current ?? document.createElement("canvas");
-        inferenceCanvasRef.current = inferenceCanvas;
-        const sourceScale = Math.min(
-          1,
-          640 / Math.max(video.videoWidth, video.videoHeight),
-        );
-        const sourceWidth = Math.max(
-          1,
-          Math.round(video.videoWidth * sourceScale),
-        );
-        const sourceHeight = Math.max(
-          1,
-          Math.round(video.videoHeight * sourceScale),
-        );
-        if (
-          inferenceCanvas.width !== sourceWidth ||
-          inferenceCanvas.height !== sourceHeight
-        ) {
-          inferenceCanvas.width = sourceWidth;
-          inferenceCanvas.height = sourceHeight;
-        }
-        const inferenceContext = inferenceCanvas.getContext("2d", {
-          alpha: false,
-        });
-        if (!inferenceContext) return;
-        inferenceContext.drawImage(
-          video,
-          0,
-          0,
-          sourceWidth,
-          sourceHeight,
-        );
-
-        const results = await model.predict(inferenceCanvas, {
+        const results = await model.predict(frame, {
           conf: 0.36,
           iou: 0.52,
           classes: ROAD_CLASS_IDS,
@@ -621,10 +674,10 @@ export default function Home() {
           return;
         }
 
-        const resultWidth = results.width || sourceWidth;
-        const resultHeight = results.height || sourceHeight;
-        const scaleX = video.videoWidth / resultWidth;
-        const scaleY = video.videoHeight / resultHeight;
+        const resultWidth = results.width || frame.width;
+        const resultHeight = results.height || frame.height;
+        const scaleX = frame.width / resultWidth;
+        const scaleY = frame.height / resultHeight;
         const displayBoxes = results.boxes.map((box) => ({
           ...box,
           x1: box.x1 * scaleX,
@@ -640,8 +693,8 @@ export default function Home() {
         const now = performance.now();
         const analyzed = analyzeDetections(
           displayBoxes,
-          video.videoWidth,
-          video.videoHeight,
+          frame.width,
+          frame.height,
           modeRef.current,
           now,
           trackStoreRef.current,
@@ -675,23 +728,19 @@ export default function Home() {
         });
         if (nextAlert) playWarning(nextAlert);
 
+        inferenceErrorCountRef.current = 0;
         const elapsed = performance.now() - startedAt;
         const moving = !motion.reliable || motion.speedMps >= 1.2;
-        const intervalFloor =
-          model.device === "webgpu"
-            ? moving
-              ? 110
-              : 260
-            : moving
-              ? 240
-              : 560;
-        inferenceIntervalRef.current = Math.min(
-          moving ? 900 : 1200,
-          Math.max(
-            intervalFloor,
-            elapsed * (model.device === "webgpu" ? 0.25 : 0.34),
-          ),
-        );
+        const profile = runtimeProfileRef.current;
+        let cooldown = moving
+          ? profile.inferenceMovingCooldown
+          : profile.inferenceStoppedCooldown;
+        if (!profile.ios && model.device !== "webgpu") {
+          cooldown = Math.max(cooldown, moving ? 340 : 620);
+        }
+        // lastInferenceAtRef records the start time, so include inference time
+        // to guarantee a real cooldown instead of immediately starting again.
+        inferenceIntervalRef.current = elapsed + cooldown;
 
         const stats = statsRef.current;
         if (!stats.startedAt) stats.startedAt = performance.now();
@@ -703,6 +752,25 @@ export default function Home() {
         }
       } catch (error) {
         console.error("YOLO inference failed", error);
+        inferenceErrorCountRef.current += 1;
+        if (
+          inferenceErrorCountRef.current >= 3 &&
+          modelRef.current === model
+        ) {
+          model.free();
+          modelRef.current = null;
+          modelPromiseRef.current = null;
+          detectionsRef.current = [];
+          alertRef.current = null;
+          alertHoldRef.current = { alert: null, lastSeenAt: 0 };
+          setDetectedCount(0);
+          setAlert(null);
+          setModelBackend("");
+          setModelError(
+            "หยุด AI ชั่วคราวเพื่อป้องกัน Safari ปิดหน้า กด “ลองใหม่” เพื่อเริ่มโหมดเสถียร",
+          );
+          setModelState("error");
+        }
       } finally {
         inferenceBusyRef.current = false;
       }
@@ -722,16 +790,19 @@ export default function Home() {
         const video = videoRef.current;
         const canvas = canvasRef.current;
         if (video && canvas && video.videoWidth && video.videoHeight) {
+          const profile = runtimeProfileRef.current;
+          const dimensions = visionFrameSize(
+            video.videoWidth,
+            video.videoHeight,
+            profile.inputMax,
+          );
           const dimensionsChanged =
-            frameSizeRef.current.width !== video.videoWidth ||
-            frameSizeRef.current.height !== video.videoHeight;
+            frameSizeRef.current.width !== dimensions.width ||
+            frameSizeRef.current.height !== dimensions.height;
           if (dimensionsChanged) {
-            frameSizeRef.current = {
-              width: video.videoWidth,
-              height: video.videoHeight,
-            };
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
+            frameSizeRef.current = dimensions;
+            canvas.width = dimensions.width;
+            canvas.height = dimensions.height;
             trackStoreRef.current = { nextId: 1, tracks: new Map() };
             roadSceneRef.current = emptyRoadScene(elapsed);
             roadSceneTrackerRef.current = createRoadSceneTracker();
@@ -742,20 +813,57 @@ export default function Home() {
             setAlert(null);
           }
 
-          const roadInterval =
-            motionRef.current.reliable &&
-            motionRef.current.speedMps < 0.8
-              ? 320
-              : 190;
-          if (
+          const moving =
+            !motionRef.current.reliable ||
+            motionRef.current.speedMps >= 0.8;
+          const roadInterval = moving
+            ? profile.roadIntervalMoving
+            : profile.roadIntervalStopped;
+          const roadDue =
             modeRef.current === "drive" &&
-            elapsed - lastRoadAnalysisAtRef.current >= roadInterval
+            elapsed - lastRoadAnalysisAtRef.current >= roadInterval;
+          const inferenceDue =
+            Boolean(modelRef.current) &&
+            elapsed - lastInferenceAtRef.current >=
+              inferenceIntervalRef.current;
+
+          if (
+            !inferenceBusyRef.current &&
+            (roadDue || inferenceDue)
           ) {
-            lastRoadAnalysisAtRef.current = elapsed;
-            analyzeCurrentRoad(elapsed);
+            try {
+              const captured = captureCurrentFrame();
+              if (captured) {
+                if (roadDue) {
+                  lastRoadAnalysisAtRef.current = elapsed;
+                  roadSceneRef.current = analyzeRoadSceneScaled(
+                    captured.data,
+                    captured.width,
+                    captured.height,
+                    roadSceneTrackerRef.current,
+                    elapsed,
+                    profile.roadMax,
+                  );
+                }
+                if (inferenceDue) {
+                  lastInferenceAtRef.current = elapsed;
+                  void runInference(session, captured);
+                }
+              }
+            } catch (error) {
+              console.warn("Vision frame capture failed", error);
+              if (roadDue) {
+                lastRoadAnalysisAtRef.current = elapsed;
+                roadSceneRef.current = emptyRoadScene(elapsed);
+                roadSceneTrackerRef.current = createRoadSceneTracker();
+              }
+            }
           }
 
-          if (elapsed - lastOverlayAtRef.current >= 33) {
+          if (
+            elapsed - lastOverlayAtRef.current >=
+            profile.overlayInterval
+          ) {
             lastOverlayAtRef.current = elapsed;
             renderVisionOverlay(
               canvas,
@@ -766,21 +874,12 @@ export default function Home() {
               roadSceneRef.current,
             );
           }
-          if (
-            modelRef.current &&
-            elapsed - lastInferenceAtRef.current >=
-              inferenceIntervalRef.current &&
-            !inferenceBusyRef.current
-          ) {
-            lastInferenceAtRef.current = elapsed;
-            void runInference(session);
-          }
         }
         animationRef.current = requestAnimationFrame(frame);
       };
       animationRef.current = requestAnimationFrame(frame);
     },
-    [analyzeCurrentRoad, runInference],
+    [captureCurrentFrame, runInference],
   );
 
   const refreshCameraList = useCallback(async () => {
@@ -807,11 +906,25 @@ export default function Home() {
       }
 
       await unlockAudio();
+      const recovery =
+        recoveryCheckedRef.current ?? hadUncleanVisionSession();
+      recoveryCheckedRef.current = recovery;
+      const profile = selectRuntimeProfile(recovery);
+      runtimeProfileRef.current = profile;
+      setRuntimeLabel(
+        profile.recovery
+          ? "กู้คืน"
+          : profile.ios
+            ? "เสถียร"
+            : "",
+      );
       stopCamera();
       const session = ++cameraSessionRef.current;
       lastInferenceAtRef.current = 0;
       lastOverlayAtRef.current = 0;
       lastRoadAnalysisAtRef.current = 0;
+      inferenceIntervalRef.current = 0;
+      inferenceErrorCountRef.current = 0;
       setCameraState("requesting");
       setErrorMessage("");
       void loadYolo().catch(() => undefined);
@@ -820,13 +933,15 @@ export default function Home() {
         captureOrientationRef.current = orientation;
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: false,
-          video: cameraConstraints(orientation, deviceId),
+          video: cameraConstraints(deviceId),
         });
         if (session !== cameraSessionRef.current) {
           stream.getTracks().forEach((track) => track.stop());
           return;
         }
         streamRef.current = stream;
+        const cameraTrack = stream.getVideoTracks()[0];
+        if (cameraTrack) await resetCameraZoom(cameraTrack);
         const video = videoRef.current;
         if (!video) throw new Error("camera-view-missing");
         video.srcObject = stream;
@@ -835,6 +950,11 @@ export default function Home() {
         await refreshCameraList();
         await requestWakeLock();
         runningRef.current = true;
+        markVisionSession(true);
+        visionHeartbeatRef.current = setInterval(
+          () => markVisionSession(true),
+          15000,
+        );
         setCameraState("running");
         if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
         hideTimerRef.current = setTimeout(
@@ -844,7 +964,7 @@ export default function Home() {
         beginVisionLoop(session);
       } catch (error) {
         console.error(error);
-        stopLocationTracking();
+        stopCamera();
         setErrorMessage(
           "เปิดกล้องไม่ได้ กรุณาอนุญาต Camera ใน Safari แล้วลองอีกครั้ง",
         );
@@ -858,7 +978,6 @@ export default function Home() {
       requestWakeLock,
       startLocationTracking,
       stopCamera,
-      stopLocationTracking,
       unlockAudio,
     ],
   );
@@ -879,6 +998,11 @@ export default function Home() {
   }, [unlockAudio]);
 
   const retryModel = useCallback(() => {
+    const recoveryProfile = selectRuntimeProfile(true);
+    runtimeProfileRef.current = recoveryProfile;
+    setRuntimeLabel(recoveryProfile.ios ? "กู้คืน" : "");
+    inferenceErrorCountRef.current = 0;
+    inferenceIntervalRef.current = 0;
     modelPromiseRef.current = null;
     void loadYolo().catch(() => undefined);
   }, [loadYolo]);
@@ -911,10 +1035,14 @@ export default function Home() {
     const onVisibilityChange = () => {
       if (!document.hidden && runningRef.current) void requestWakeLock();
     };
+    const onPageHide = () => stopCamera();
     document.addEventListener("visibilitychange", onVisibilityChange);
-    return () =>
+    window.addEventListener("pagehide", onPageHide);
+    return () => {
       document.removeEventListener("visibilitychange", onVisibilityChange);
-  }, [requestWakeLock]);
+      window.removeEventListener("pagehide", onPageHide);
+    };
+  }, [requestWakeLock, stopCamera]);
 
   useEffect(() => {
     const applyOrientation = () => {
@@ -929,13 +1057,6 @@ export default function Home() {
       alertHoldRef.current = { alert: null, lastSeenAt: 0 };
       setDetectedCount(0);
       setAlert(null);
-
-      const track = streamRef.current?.getVideoTracks()[0];
-      if (track) {
-        void track.applyConstraints(captureShape(orientation)).catch(() => {
-          // iOS may rotate the stream itself even when constraints are fixed.
-        });
-      }
     };
     const scheduleOrientation = () => {
       if (orientationTimerRef.current) {
@@ -965,8 +1086,9 @@ export default function Home() {
   useEffect(
     () => () => {
       stopCamera();
-      modelRef.current?.free();
+      if (!inferenceBusyRef.current) modelRef.current?.free();
       modelRef.current = null;
+      modelPromiseRef.current = null;
       void audioContextRef.current?.close();
     },
     [stopCamera],
@@ -974,7 +1096,7 @@ export default function Home() {
 
   const liveStatus =
     modelState === "ready"
-      ? `${modelBackend === "webgpu" ? "GPU" : "CPU"} • ${fps ? fps.toFixed(1) : "—"} FPS`
+      ? `${modelBackend === "webgpu" ? "GPU" : "CPU"} • ${fps ? fps.toFixed(1) : "—"} FPS${runtimeLabel ? ` • ${runtimeLabel}` : ""}`
       : modelState === "loading"
         ? `โหลด YOLO ${modelProgress}%`
         : modelState === "error"
@@ -1270,8 +1392,10 @@ export default function Home() {
               <li>อย่าถือหรือแตะหน้าจอขณะขี่หรือขับรถ</li>
               <li>อนุญาตตำแหน่งเพื่อใช้ความเร็ว GPS ปรับระยะเตือน</li>
               <li>GPS และระยะบนจอเป็นค่าประมาณ อาจคลาดเคลื่อนหรือขาดหาย</li>
+              <li>ภาพจะแสดงครบทั้งเฟรมที่กล้องส่งมา จึงอาจมีขอบดำเมื่อสัดส่วนหน้าจอไม่ตรงกับกล้อง</li>
               <li>เส้นเลนจะแสดงเฉพาะเมื่อพบขอบเลนซ้ายและขวาด้วยความมั่นใจเพียงพอ</li>
               <li>พื้นที่ใต้ขอบตัวรถที่ตรวจพบจะถูกตัดออก เพื่อลดการตรวจคอนโซลผิดเป็นวัตถุ</li>
+              <li>บน iPhone ระบบจำกัดเฟรมและจะสลับเป็น CPU โหมดกู้คืนอัตโนมัติหลังการปิดหน้าผิดปกติ</li>
               <li>บน iPhone ใช้ แชร์ → เพิ่มไปยังหน้าจอโฮม เพื่อเปิดแบบเต็มจอ</li>
             </ul>
             <div className="privacy-box">

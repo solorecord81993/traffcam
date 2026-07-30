@@ -698,7 +698,7 @@ export function analyzeDetections(
   const detections: AnalyzedDetection[] = [];
 
   for (const box of boxes) {
-    if (detections.length >= 14) break;
+    if (detections.length >= 10) break;
     const name = box.name.toLowerCase();
     if (!PHYSICAL_HAZARDS.has(name) && !INFORMATIONAL_OBJECTS.has(name)) {
       continue;
@@ -978,8 +978,8 @@ function drawCornerBox(
   const color = RISK_COLOR[detection.risk];
   const boxWidth = detection.x2 - detection.x1;
   const boxHeight = detection.y2 - detection.y1;
-  const corner = clamp(Math.min(boxWidth, boxHeight) * 0.18, 12, 38);
-  const lineWidth = clamp(width / 260, 3, 7);
+  const corner = clamp(Math.min(boxWidth, boxHeight) * 0.18, 6, 24);
+  const lineWidth = clamp(width / 300, 1.5, 4.5);
   const x1 = clamp(detection.x1, 1, width - 2);
   const y1 = clamp(detection.y1, 1, height - 2);
   const x2 = clamp(detection.x2, 2, width - 1);
@@ -1022,7 +1022,7 @@ function drawCornerBox(
       detection.risk === "danger"
         ? "rgba(255, 79, 100, 0.55)"
         : "rgba(255, 171, 74, 0.45)";
-    context.lineWidth = Math.max(2, lineWidth * 0.6);
+    context.lineWidth = Math.max(1, lineWidth * 0.6);
     context.beginPath();
     detection.history.forEach((point, index) => {
       if (index === 0) context.moveTo(point.x, point.y);
@@ -1031,7 +1031,7 @@ function drawCornerBox(
     context.stroke();
   }
 
-  const fontSize = clamp(width / 37, 15, 30);
+  const fontSize = clamp(width / 44, 8, 18);
   context.font = `700 ${fontSize}px "Noto Sans Thai", "Thonburi", sans-serif`;
   const distance = formatDistance(detection.distance);
   const text = `${detection.thaiName}  ${distance}`;
@@ -1074,7 +1074,13 @@ function drawCornerBox(
 
   context.fillStyle = color;
   context.beginPath();
-  context.arc((x1 + x2) / 2, y2, Math.max(4, lineWidth), 0, Math.PI * 2);
+  context.arc(
+    (x1 + x2) / 2,
+    y2,
+    Math.max(2.5, lineWidth),
+    0,
+    Math.PI * 2,
+  );
   context.fill();
 }
 

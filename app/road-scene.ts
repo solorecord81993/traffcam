@@ -32,6 +32,8 @@ export type RoadSceneTracker = {
   laneEvidence: number;
   dashboard: DashboardMask | null;
   dashboardEvidence: number;
+  scratchPixels: Uint8ClampedArray | null;
+  scratchLuminance: Float32Array | null;
 };
 
 type EdgePoint = {
@@ -72,6 +74,8 @@ export function createRoadSceneTracker(): RoadSceneTracker {
     laneEvidence: 0,
     dashboard: null,
     dashboardEvidence: 0,
+    scratchPixels: null,
+    scratchLuminance: null,
   };
 }
 
@@ -83,8 +87,13 @@ function luminanceBuffer(
   pixels: Uint8ClampedArray,
   width: number,
   height: number,
+  reusable: Float32Array | null,
 ) {
-  const luminance = new Float32Array(width * height);
+  const requiredLength = width * height;
+  const luminance =
+    reusable?.length === requiredLength
+      ? reusable
+      : new Float32Array(requiredLength);
   for (let index = 0; index < luminance.length; index += 1) {
     const pixelIndex = index * 4;
     luminance[index] =
@@ -275,7 +284,7 @@ function collectLaneEdges(
         luminance[center + width] * 2 +
         luminance[center + width + 1];
       const magnitude = Math.hypot(gx, gy);
-      if (magnitude < 64 || Math.abs(gx) < Math.abs(gy) * 0.18) continue;
+      if (magnitude < 54 || Math.abs(gx) < Math.abs(gy) * 0.16) continue;
 
       const pixelIndex = center * 4;
       const red = pixels[pixelIndex];
@@ -317,8 +326,8 @@ function fitLaneLine(
 
   for (const point of points) {
     if (
-      (side === "left" && point.x > 0.59) ||
-      (side === "right" && point.x < 0.41)
+      (side === "left" && point.x > 0.64) ||
+      (side === "right" && point.x < 0.36)
     ) {
       continue;
     }
@@ -349,7 +358,7 @@ function fitLaneLine(
       bestIndex = index;
     }
   }
-  if (bestIndex < 0 || bestVotes < 13) return null;
+  if (bestIndex < 0 || bestVotes < 10) return null;
 
   const slopeIndex = Math.floor(bestIndex / interceptBins);
   const interceptIndex = bestIndex % interceptBins;
@@ -361,14 +370,14 @@ function fitLaneLine(
       (interceptMaximum - interceptMinimum);
   let support = points.filter((point) => {
     if (
-      (side === "left" && point.x > 0.61) ||
-      (side === "right" && point.x < 0.39)
+      (side === "left" && point.x > 0.66) ||
+      (side === "right" && point.x < 0.34)
     ) {
       return false;
     }
     return Math.abs(point.x - (slope * point.y + intercept)) <= 0.022;
   });
-  if (support.length < 9) return null;
+  if (support.length < 7) return null;
 
   let totalWeight = 0;
   let sumY = 0;
@@ -396,9 +405,9 @@ function fitLaneLine(
 
   support = points.filter(
     (point) =>
-      Math.abs(point.x - (slope * point.y + intercept)) <= 0.02,
+      Math.abs(point.x - (slope * point.y + intercept)) <= 0.024,
   );
-  if (support.length < 9) return null;
+  if (support.length < 7) return null;
 
   const coveredBands = new Set<number>();
   let residualTotal = 0;
@@ -425,12 +434,12 @@ function fitLaneLine(
   const confidence = clamp(
     (coverage - 0.16) * 1.45 +
       clamp((weightedSupport - 15) / 95, 0, 0.35) +
-      clamp((0.018 - residual) / 0.018, 0, 0.25) +
+      clamp((0.024 - residual) / 0.024, 0, 0.25) +
       paintRatio * 0.2,
     0,
     1,
   );
-  if (coverage < 0.24 || residual > 0.018 || confidence < 0.36) {
+  if (coverage < 0.18 || residual > 0.024 || confidence < 0.29) {
     return null;
   }
 
@@ -486,7 +495,7 @@ function detectLane(
   height: number,
   dashboard: DashboardMask | null,
 ): DetectedLane | null {
-  const roiTop = 0.34;
+  const roiTop = 0.3;
   const roadBottom = clamp(
     dashboard ? dashboard.topY - 0.012 : 0.955,
     0.68,
@@ -513,9 +522,9 @@ function detectLane(
   const vanishX = left.slope * vanishY + left.intercept;
   if (
     vanishY < 0.16 ||
-    vanishY > 0.67 ||
-    vanishX < 0.2 ||
-    vanishX > 0.8
+    vanishY > 0.72 ||
+    vanishX < 0.16 ||
+    vanishX > 0.84
   ) {
     return null;
   }
@@ -553,7 +562,7 @@ function detectLane(
     0,
     1,
   );
-  if (perspectiveGrowth < 1.35 || geometryConfidence < 0.46) return null;
+  if (perspectiveGrowth < 1.18 || geometryConfidence < 0.38) return null;
 
   const confidence = clamp(
     Math.min(left.confidence, right.confidence) * 0.72 +
@@ -561,7 +570,7 @@ function detectLane(
     0,
     1,
   );
-  if (confidence < 0.43) return null;
+  if (confidence < 0.34) return null;
   return {
     left: { points: traceBoundary(left, topY, roadBottom) },
     right: { points: traceBoundary(right, topY, roadBottom) },
@@ -687,7 +696,13 @@ export function analyzeRoadScene(
     return emptyRoadScene(analyzedAt);
   }
 
-  const luminance = luminanceBuffer(pixels, width, height);
+  const luminance = luminanceBuffer(
+    pixels,
+    width,
+    height,
+    tracker.scratchLuminance,
+  );
+  tracker.scratchLuminance = luminance;
   const rawDashboard = detectDashboard(luminance, width, height);
   const dashboard = stabilizeDashboard(rawDashboard, tracker);
   const rawLane = detectLane(
@@ -699,6 +714,65 @@ export function analyzeRoadScene(
   );
   const lane = stabilizeLane(rawLane, tracker);
   return { lane, dashboard, analyzedAt };
+}
+
+export function analyzeRoadSceneScaled(
+  pixels: Uint8ClampedArray,
+  sourceWidth: number,
+  sourceHeight: number,
+  tracker: RoadSceneTracker,
+  analyzedAt: number,
+  maxDimension = 256,
+): RoadScene {
+  const scale = Math.min(
+    1,
+    maxDimension / Math.max(sourceWidth, sourceHeight),
+  );
+  const width = Math.max(96, Math.round(sourceWidth * scale));
+  const height = Math.max(96, Math.round(sourceHeight * scale));
+  if (width === sourceWidth && height === sourceHeight) {
+    return analyzeRoadScene(
+      pixels,
+      sourceWidth,
+      sourceHeight,
+      tracker,
+      analyzedAt,
+    );
+  }
+
+  const requiredLength = width * height * 4;
+  const scaled =
+    tracker.scratchPixels?.length === requiredLength
+      ? tracker.scratchPixels
+      : new Uint8ClampedArray(requiredLength);
+  tracker.scratchPixels = scaled;
+
+  for (let y = 0; y < height; y += 1) {
+    const sourceY = Math.min(
+      sourceHeight - 1,
+      Math.floor((y * sourceHeight) / height),
+    );
+    for (let x = 0; x < width; x += 1) {
+      const sourceX = Math.min(
+        sourceWidth - 1,
+        Math.floor((x * sourceWidth) / width),
+      );
+      const sourceIndex = (sourceY * sourceWidth + sourceX) * 4;
+      const targetIndex = (y * width + x) * 4;
+      scaled[targetIndex] = pixels[sourceIndex];
+      scaled[targetIndex + 1] = pixels[sourceIndex + 1];
+      scaled[targetIndex + 2] = pixels[sourceIndex + 2];
+      scaled[targetIndex + 3] = pixels[sourceIndex + 3];
+    }
+  }
+
+  return analyzeRoadScene(
+    scaled,
+    width,
+    height,
+    tracker,
+    analyzedAt,
+  );
 }
 
 function interpolateAtAxis(
