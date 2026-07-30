@@ -116,6 +116,7 @@ button:focus-visible {
   z-index: -3;
   display: none;
   object-fit: cover;
+  object-position: center center;
   background: #030507;
 }
 
@@ -124,6 +125,7 @@ button:focus-visible {
   display: none;
   pointer-events: none;
   object-fit: cover;
+  object-position: center center;
 }
 
 .camera-vignette {

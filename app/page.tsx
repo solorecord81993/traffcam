@@ -26,6 +26,12 @@ import {
   type GeoFix,
 } from "./motion";
 import {
+  analyzeRoadScene,
+  createRoadSceneTracker,
+  emptyRoadScene,
+  type RoadScene,
+} from "./road-scene";
+import {
   analyzeDetections,
   formatDistance,
   renderVisionOverlay,
@@ -95,10 +101,47 @@ function concatenateChunks(chunks: Uint8Array[], totalBytes: number) {
   return output;
 }
 
+function captureOrientation() {
+  return window.innerHeight >= window.innerWidth
+    ? ("portrait" as const)
+    : ("landscape" as const);
+}
+
+function captureShape(
+  orientation: "portrait" | "landscape",
+): MediaTrackConstraints {
+  const portrait = orientation === "portrait";
+  return {
+    width: {
+      ideal: portrait ? 720 : 1280,
+      max: portrait ? 720 : 1280,
+    },
+    height: {
+      ideal: portrait ? 1280 : 720,
+      max: portrait ? 1280 : 720,
+    },
+    aspectRatio: { ideal: portrait ? 9 / 16 : 16 / 9 },
+    frameRate: { ideal: 24, max: 30 },
+  };
+}
+
+function cameraConstraints(
+  orientation: "portrait" | "landscape",
+  deviceId?: string,
+): MediaTrackConstraints {
+  return {
+    ...captureShape(orientation),
+    ...(deviceId
+      ? { deviceId: { exact: deviceId } }
+      : { facingMode: { ideal: "environment" } }),
+  };
+}
+
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const inferenceCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const roadCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animationRef = useRef<number | null>(null);
   const geolocationWatchRef = useRef<number | null>(null);
@@ -113,8 +156,18 @@ export default function Home() {
   const inferenceBusyRef = useRef(false);
   const lastInferenceAtRef = useRef(0);
   const lastOverlayAtRef = useRef(0);
+  const lastRoadAnalysisAtRef = useRef(0);
   const inferenceIntervalRef = useRef(260);
   const detectionsRef = useRef<AnalyzedDetection[]>([]);
+  const roadSceneRef = useRef<RoadScene>(emptyRoadScene());
+  const roadSceneTrackerRef = useRef(createRoadSceneTracker());
+  const frameSizeRef = useRef({ width: 0, height: 0 });
+  const captureOrientationRef = useRef<
+    "portrait" | "landscape" | null
+  >(null);
+  const orientationTimerRef = useRef<ReturnType<
+    typeof setTimeout
+  > | null>(null);
   const alertRef = useRef<VisionAlert | null>(null);
   const alertHoldRef = useRef<{
     alert: VisionAlert | null;
@@ -160,6 +213,8 @@ export default function Home() {
     if (modeRef.current === nextMode) return;
     modeRef.current = nextMode;
     trackStoreRef.current = { nextId: 1, tracks: new Map() };
+    roadSceneRef.current = emptyRoadScene();
+    roadSceneTrackerRef.current = createRoadSceneTracker();
     detectionsRef.current = [];
     alertRef.current = null;
     alertHoldRef.current = { alert: null, lastSeenAt: 0 };
@@ -439,6 +494,9 @@ export default function Home() {
     void wakeLockRef.current?.release();
     wakeLockRef.current = null;
     detectionsRef.current = [];
+    roadSceneRef.current = emptyRoadScene();
+    roadSceneTrackerRef.current = createRoadSceneTracker();
+    frameSizeRef.current = { width: 0, height: 0 };
     alertRef.current = null;
     alertHoldRef.current = { alert: null, lastSeenAt: 0 };
     trackStoreRef.current = { nextId: 1, tracks: new Map() };
@@ -446,6 +504,59 @@ export default function Home() {
     setDetectedCount(0);
     setFps(0);
   }, [stopLocationTracking]);
+
+  const analyzeCurrentRoad = useCallback((analyzedAt: number) => {
+    const video = videoRef.current;
+    if (
+      modeRef.current !== "drive" ||
+      !video ||
+      video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+      !video.videoWidth ||
+      !video.videoHeight
+    ) {
+      roadSceneRef.current = emptyRoadScene(analyzedAt);
+      roadSceneTrackerRef.current = createRoadSceneTracker();
+      return;
+    }
+
+    try {
+      const analysisCanvas =
+        roadCanvasRef.current ?? document.createElement("canvas");
+      roadCanvasRef.current = analysisCanvas;
+      const scale = Math.min(
+        1,
+        320 / Math.max(video.videoWidth, video.videoHeight),
+      );
+      const width = Math.max(96, Math.round(video.videoWidth * scale));
+      const height = Math.max(96, Math.round(video.videoHeight * scale));
+      if (
+        analysisCanvas.width !== width ||
+        analysisCanvas.height !== height
+      ) {
+        analysisCanvas.width = width;
+        analysisCanvas.height = height;
+        roadSceneTrackerRef.current = createRoadSceneTracker();
+      }
+      const context = analysisCanvas.getContext("2d", {
+        alpha: false,
+        willReadFrequently: true,
+      });
+      if (!context) return;
+      context.drawImage(video, 0, 0, width, height);
+      const frame = context.getImageData(0, 0, width, height);
+      roadSceneRef.current = analyzeRoadScene(
+        frame.data,
+        width,
+        height,
+        roadSceneTrackerRef.current,
+        analyzedAt,
+      );
+    } catch (error) {
+      console.warn("Road scene analysis failed", error);
+      roadSceneRef.current = emptyRoadScene(analyzedAt);
+      roadSceneTrackerRef.current = createRoadSceneTracker();
+    }
+  }, []);
 
   const runInference = useCallback(
     async (session: number) => {
@@ -535,6 +646,7 @@ export default function Home() {
           now,
           trackStoreRef.current,
           motion,
+          roadSceneRef.current,
         );
         const nextAlert = selectAlert(analyzed, modeRef.current, motion);
         let visibleAlert = nextAlert;
@@ -610,21 +722,48 @@ export default function Home() {
         const video = videoRef.current;
         const canvas = canvasRef.current;
         if (video && canvas && video.videoWidth && video.videoHeight) {
+          const dimensionsChanged =
+            frameSizeRef.current.width !== video.videoWidth ||
+            frameSizeRef.current.height !== video.videoHeight;
+          if (dimensionsChanged) {
+            frameSizeRef.current = {
+              width: video.videoWidth,
+              height: video.videoHeight,
+            };
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            trackStoreRef.current = { nextId: 1, tracks: new Map() };
+            roadSceneRef.current = emptyRoadScene(elapsed);
+            roadSceneTrackerRef.current = createRoadSceneTracker();
+            detectionsRef.current = [];
+            alertRef.current = null;
+            alertHoldRef.current = { alert: null, lastSeenAt: 0 };
+            setDetectedCount(0);
+            setAlert(null);
+          }
+
+          const roadInterval =
+            motionRef.current.reliable &&
+            motionRef.current.speedMps < 0.8
+              ? 320
+              : 190;
+          if (
+            modeRef.current === "drive" &&
+            elapsed - lastRoadAnalysisAtRef.current >= roadInterval
+          ) {
+            lastRoadAnalysisAtRef.current = elapsed;
+            analyzeCurrentRoad(elapsed);
+          }
+
           if (elapsed - lastOverlayAtRef.current >= 33) {
             lastOverlayAtRef.current = elapsed;
-            if (
-              canvas.width !== video.videoWidth ||
-              canvas.height !== video.videoHeight
-            ) {
-              canvas.width = video.videoWidth;
-              canvas.height = video.videoHeight;
-            }
             renderVisionOverlay(
               canvas,
               modeRef.current,
               elapsed,
               detectionsRef.current,
               alertRef.current,
+              roadSceneRef.current,
             );
           }
           if (
@@ -641,7 +780,7 @@ export default function Home() {
       };
       animationRef.current = requestAnimationFrame(frame);
     },
-    [runInference],
+    [analyzeCurrentRoad, runInference],
   );
 
   const refreshCameraList = useCallback(async () => {
@@ -672,25 +811,16 @@ export default function Home() {
       const session = ++cameraSessionRef.current;
       lastInferenceAtRef.current = 0;
       lastOverlayAtRef.current = 0;
+      lastRoadAnalysisAtRef.current = 0;
       setCameraState("requesting");
       setErrorMessage("");
       void loadYolo().catch(() => undefined);
       try {
+        const orientation = captureOrientation();
+        captureOrientationRef.current = orientation;
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: false,
-          video: deviceId
-            ? {
-                deviceId: { exact: deviceId },
-                width: { ideal: 960, max: 1280 },
-                height: { ideal: 540, max: 720 },
-                frameRate: { ideal: 24, max: 30 },
-              }
-            : {
-                facingMode: { ideal: "environment" },
-                width: { ideal: 960, max: 1280 },
-                height: { ideal: 540, max: 720 },
-                frameRate: { ideal: 24, max: 30 },
-              },
+          video: cameraConstraints(orientation, deviceId),
         });
         if (session !== cameraSessionRef.current) {
           stream.getTracks().forEach((track) => track.stop());
@@ -786,6 +916,52 @@ export default function Home() {
       document.removeEventListener("visibilitychange", onVisibilityChange);
   }, [requestWakeLock]);
 
+  useEffect(() => {
+    const applyOrientation = () => {
+      const orientation = captureOrientation();
+      if (captureOrientationRef.current === orientation) return;
+      captureOrientationRef.current = orientation;
+      roadSceneRef.current = emptyRoadScene(performance.now());
+      roadSceneTrackerRef.current = createRoadSceneTracker();
+      detectionsRef.current = [];
+      trackStoreRef.current = { nextId: 1, tracks: new Map() };
+      alertRef.current = null;
+      alertHoldRef.current = { alert: null, lastSeenAt: 0 };
+      setDetectedCount(0);
+      setAlert(null);
+
+      const track = streamRef.current?.getVideoTracks()[0];
+      if (track) {
+        void track.applyConstraints(captureShape(orientation)).catch(() => {
+          // iOS may rotate the stream itself even when constraints are fixed.
+        });
+      }
+    };
+    const scheduleOrientation = () => {
+      if (orientationTimerRef.current) {
+        clearTimeout(orientationTimerRef.current);
+      }
+      orientationTimerRef.current = setTimeout(applyOrientation, 180);
+    };
+
+    window.addEventListener("resize", scheduleOrientation);
+    window.screen.orientation?.addEventListener(
+      "change",
+      scheduleOrientation,
+    );
+    return () => {
+      window.removeEventListener("resize", scheduleOrientation);
+      window.screen.orientation?.removeEventListener(
+        "change",
+        scheduleOrientation,
+      );
+      if (orientationTimerRef.current) {
+        clearTimeout(orientationTimerRef.current);
+        orientationTimerRef.current = null;
+      }
+    };
+  }, []);
+
   useEffect(
     () => () => {
       stopCamera();
@@ -840,7 +1016,7 @@ export default function Home() {
       <canvas
         ref={canvasRef}
         className="vision-layer"
-        aria-label="กรอบวัตถุ แนวทาง และการประเมินความเสี่ยง"
+        aria-label="กรอบวัตถุ เลนถนนที่ตรวจพบ ขอบตัวรถ และการประเมินความเสี่ยง"
       />
       <div className="camera-vignette" aria-hidden="true" />
 
@@ -886,7 +1062,7 @@ export default function Home() {
           </h1>
           <p className="lead">
             ใช้กล้อง iPhone มองวัตถุด้านหน้า
-            พร้อมพื้นที่ทางและการแจ้งเตือนบนจอ
+            พร้อมตรวจเลนจริงและการแจ้งเตือนบนจอ
           </p>
 
           <div className="mode-picker" aria-label="เลือกวิธีเดินทาง">
@@ -1094,7 +1270,8 @@ export default function Home() {
               <li>อย่าถือหรือแตะหน้าจอขณะขี่หรือขับรถ</li>
               <li>อนุญาตตำแหน่งเพื่อใช้ความเร็ว GPS ปรับระยะเตือน</li>
               <li>GPS และระยะบนจอเป็นค่าประมาณ อาจคลาดเคลื่อนหรือขาดหาย</li>
-              <li>YOLO มองวัตถุ แต่แนวทางสีเขียวเป็นทางคาดการณ์จากจุดกึ่งกลางกล้อง</li>
+              <li>เส้นเลนจะแสดงเฉพาะเมื่อพบขอบเลนซ้ายและขวาด้วยความมั่นใจเพียงพอ</li>
+              <li>พื้นที่ใต้ขอบตัวรถที่ตรวจพบจะถูกตัดออก เพื่อลดการตรวจคอนโซลผิดเป็นวัตถุ</li>
               <li>บน iPhone ใช้ แชร์ → เพิ่มไปยังหน้าจอโฮม เพื่อเปิดแบบเต็มจอ</li>
             </ul>
             <div className="privacy-box">

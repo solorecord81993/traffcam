@@ -1,5 +1,13 @@
 import type { Box } from "@ultralytics/yolo";
 import { formatSpeed, type MotionSnapshot } from "./motion";
+import {
+  dashboardTopAt,
+  laneBoundsAt,
+  type DashboardMask,
+  type DetectedLane,
+  type NormalizedPoint,
+  type RoadScene,
+} from "./road-scene";
 
 export type TravelMode = "walk" | "ride" | "drive";
 export type RiskLevel = "info" | "safe" | "watch" | "danger";
@@ -304,7 +312,25 @@ export function corridorAt(
   width: number,
   height: number,
   mode: TravelMode,
+  roadScene?: RoadScene | null,
 ) {
+  const detectedLane = mode === "drive" ? roadScene?.lane : null;
+  if (detectedLane) {
+    const normalizedY = clamp(y / height, 0, 1);
+    const bounds = laneBoundsAt(detectedLane, normalizedY);
+    const margin = width * 0.018;
+    const left = bounds.left * width - margin;
+    const right = bounds.right * width + margin;
+    return {
+      left,
+      right,
+      center: (left + right) / 2,
+      half: (right - left) / 2,
+      horizon: detectedLane.topY * height,
+      bottom: detectedLane.bottomY * height,
+    };
+  }
+
   const profile = MODE_PROFILE[mode];
   const horizon = height * 0.42;
   const bottom = height * 0.985;
@@ -322,6 +348,27 @@ export function corridorAt(
     horizon,
     bottom,
   };
+}
+
+function isDashboardDetection(
+  box: Box,
+  width: number,
+  height: number,
+  mode: TravelMode,
+  roadScene?: RoadScene | null,
+) {
+  const dashboard =
+    mode === "drive" ? roadScene?.dashboard : null;
+  if (!dashboard) return false;
+  const centerX = clamp((box.x1 + box.x2) / 2 / width, 0, 1);
+  const dashboardY = dashboardTopAt(dashboard, centerX) * height;
+  const boxHeight = Math.max(1, box.y2 - box.y1);
+  const overlap = Math.max(0, box.y2 - dashboardY) / boxHeight;
+  const centerY = (box.y1 + box.y2) / 2;
+  return (
+    centerY >= dashboardY + height * 0.006 ||
+    (overlap >= 0.58 && box.y1 >= dashboardY - height * 0.12)
+  );
 }
 
 function estimateDistance(
@@ -475,13 +522,20 @@ function assessRisk(
   height: number,
   mode: TravelMode,
   motion: MotionSnapshot,
+  roadScene?: RoadScene | null,
 ) {
   const profile = MODE_PROFILE[mode];
   const thresholds = riskThresholds(mode, motion);
   const name = box.name.toLowerCase();
   const boxWidth = Math.max(1, box.x2 - box.x1);
   const cx = (box.x1 + box.x2) / 2;
-  const currentCorridor = corridorAt(box.y2, width, height, mode);
+  const currentCorridor = corridorAt(
+    box.y2,
+    width,
+    height,
+    mode,
+    roadScene,
+  );
   const currentOverlap = overlapRatio(
     box.x1,
     box.x2,
@@ -505,6 +559,7 @@ function assessRisk(
     width,
     height,
     mode,
+    roadScene,
   );
   const predictedInPath =
     predictedBottom > predictedCorridor.horizon &&
@@ -636,6 +691,7 @@ export function analyzeDetections(
   now: number,
   store: TrackStore,
   motion: MotionSnapshot,
+  roadScene?: RoadScene | null,
 ) {
   const usedTracks = new Set<number>();
   const frameDiagonal = Math.hypot(width, height);
@@ -645,6 +701,9 @@ export function analyzeDetections(
     if (detections.length >= 14) break;
     const name = box.name.toLowerCase();
     if (!PHYSICAL_HAZARDS.has(name) && !INFORMATIONAL_OBJECTS.has(name)) {
+      continue;
+    }
+    if (isDashboardDetection(box, width, height, mode, roadScene)) {
       continue;
     }
     if (
@@ -678,6 +737,7 @@ export function analyzeDetections(
       height,
       mode,
       motion,
+      roadScene,
     );
     const stabilizedTrack = stabilizeRisk(
       trackWithDistance,
@@ -769,20 +829,68 @@ function roundedRect(
   context.closePath();
 }
 
-function drawCorridor(
+function traceNormalizedPoints(
+  context: CanvasRenderingContext2D,
+  points: NormalizedPoint[],
+  width: number,
+  height: number,
+) {
+  points.forEach((point, index) => {
+    const x = point.x * width;
+    const y = point.y * height;
+    if (index === 0) context.moveTo(x, y);
+    else context.lineTo(x, y);
+  });
+}
+
+function drawDashboardMask(
   context: CanvasRenderingContext2D,
   width: number,
   height: number,
-  mode: TravelMode,
+  dashboard: DashboardMask,
+) {
+  if (dashboard.points.length < 2) return;
+  context.save();
+  const fill = context.createLinearGradient(
+    0,
+    dashboard.topY * height,
+    0,
+    height,
+  );
+  fill.addColorStop(0, "rgba(3, 8, 12, 0.08)");
+  fill.addColorStop(0.22, "rgba(3, 8, 12, 0.2)");
+  fill.addColorStop(1, "rgba(3, 8, 12, 0.38)");
+
+  context.beginPath();
+  traceNormalizedPoints(context, dashboard.points, width, height);
+  context.lineTo(width, height);
+  context.lineTo(0, height);
+  context.closePath();
+  context.fillStyle = fill;
+  context.fill();
+
+  context.beginPath();
+  traceNormalizedPoints(context, dashboard.points, width, height);
+  context.setLineDash([
+    Math.max(8, width * 0.012),
+    Math.max(7, width * 0.009),
+  ]);
+  context.lineWidth = Math.max(1.5, width * 0.0022);
+  context.strokeStyle = "rgba(126, 231, 255, 0.52)";
+  context.shadowColor = "rgba(126, 231, 255, 0.34)";
+  context.shadowBlur = 7;
+  context.stroke();
+  context.restore();
+}
+
+function drawDetectedLane(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  lane: DetectedLane,
   elapsed: number,
   alert: VisionAlert | null,
 ) {
-  const profile = MODE_PROFILE[mode];
-  const horizon = height * 0.42;
-  const center = width * 0.5;
-  const farHalf = width * 0.055;
-  const nearHalf = width * profile.corridorWidth;
-  const bottom = height * 0.985;
   const color =
     alert?.level === "danger"
       ? "255, 79, 100"
@@ -790,42 +898,75 @@ function drawCorridor(
         ? "255, 171, 74"
         : "83, 255, 188";
 
-  const fill = context.createLinearGradient(0, horizon, 0, bottom);
+  const top = lane.topY * height;
+  const bottom = lane.bottomY * height;
+  const fill = context.createLinearGradient(0, top, 0, bottom);
   fill.addColorStop(0, `rgba(${color}, 0)`);
-  fill.addColorStop(0.35, `rgba(${color}, 0.055)`);
-  fill.addColorStop(1, `rgba(${color}, 0.17)`);
+  fill.addColorStop(0.38, `rgba(${color}, 0.045)`);
+  fill.addColorStop(1, `rgba(${color}, 0.13)`);
 
+  context.save();
   context.beginPath();
-  context.moveTo(center - farHalf, horizon);
-  context.lineTo(center + farHalf, horizon);
-  context.lineTo(center + nearHalf, bottom);
-  context.lineTo(center - nearHalf, bottom);
+  traceNormalizedPoints(context, lane.left.points, width, height);
+  [...lane.right.points].reverse().forEach((point) => {
+    context.lineTo(point.x * width, point.y * height);
+  });
   context.closePath();
   context.fillStyle = fill;
   context.fill();
 
-  context.lineWidth = Math.max(3, width * 0.005);
+  context.lineWidth = Math.max(2.5, width * 0.0042);
+  context.lineJoin = "round";
+  context.lineCap = "round";
   context.strokeStyle = `rgba(${color}, 0.88)`;
-  context.shadowColor = `rgba(${color}, 0.72)`;
-  context.shadowBlur = 12;
+  context.shadowColor = `rgba(${color}, 0.64)`;
+  context.shadowBlur = 10;
   context.beginPath();
-  context.moveTo(center - farHalf, horizon);
-  context.lineTo(center - nearHalf, bottom);
-  context.moveTo(center + farHalf, horizon);
-  context.lineTo(center + nearHalf, bottom);
+  traceNormalizedPoints(context, lane.left.points, width, height);
+  context.stroke();
+  context.beginPath();
+  traceNormalizedPoints(context, lane.right.points, width, height);
   context.stroke();
   context.shadowBlur = 0;
 
   const pulse = (elapsed / 1550) % 1;
-  const y = horizon + (bottom - horizon) * pulse;
-  const progress = (y - horizon) / Math.max(1, bottom - horizon);
-  const half = farHalf + (nearHalf - farHalf) * Math.pow(progress, 1.08);
-  const scan = context.createLinearGradient(center - half, 0, center + half, 0);
+  const normalizedY = lane.topY + (lane.bottomY - lane.topY) * pulse;
+  const bounds = laneBoundsAt(lane, normalizedY);
+  const left = bounds.left * width;
+  const right = bounds.right * width;
+  const y = normalizedY * height;
+  const scan = context.createLinearGradient(left, 0, right, 0);
   scan.addColorStop(0, `rgba(${color}, 0)`);
   scan.addColorStop(0.5, `rgba(${color}, 0.58)`);
   scan.addColorStop(1, `rgba(${color}, 0)`);
   context.fillStyle = scan;
-  context.fillRect(center - half, y, half * 2, Math.max(2, height * 0.003));
+  context.fillRect(left, y, right - left, Math.max(2, height * 0.003));
+  context.restore();
+}
+
+function drawRoadScene(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  mode: TravelMode,
+  elapsed: number,
+  roadScene: RoadScene | null,
+  alert: VisionAlert | null,
+) {
+  if (mode !== "drive" || !roadScene) return;
+  if (roadScene.dashboard) {
+    drawDashboardMask(context, width, height, roadScene.dashboard);
+  }
+  if (roadScene.lane) {
+    drawDetectedLane(
+      context,
+      width,
+      height,
+      roadScene.lane,
+      elapsed,
+      alert,
+    );
+  }
 }
 
 function drawCornerBox(
@@ -943,13 +1084,22 @@ export function renderVisionOverlay(
   elapsed: number,
   detections: AnalyzedDetection[],
   alert: VisionAlert | null,
+  roadScene: RoadScene | null,
 ) {
   const context = canvas.getContext("2d");
   if (!context) return;
   const width = canvas.width;
   const height = canvas.height;
   context.clearRect(0, 0, width, height);
-  drawCorridor(context, width, height, mode, elapsed, alert);
+  drawRoadScene(
+    context,
+    width,
+    height,
+    mode,
+    elapsed,
+    roadScene,
+    alert,
+  );
   detections.forEach((detection) =>
     drawCornerBox(context, detection, width, height),
   );
