@@ -42,7 +42,12 @@ import {
   type VisionAlert,
 } from "./vision";
 
-type CameraState = "idle" | "requesting" | "running" | "error";
+type CameraState =
+  | "idle"
+  | "requesting"
+  | "resuming"
+  | "running"
+  | "error";
 type ModelState = "idle" | "loading" | "ready" | "error";
 type GpsState =
   | "idle"
@@ -56,7 +61,10 @@ type RuntimeProfile = {
   ios: boolean;
   recovery: boolean;
   modelDevice: "auto" | "cpu";
+  cameraMaxWidth: number;
+  cameraMaxFps: number;
   inputMax: number;
+  overlayMax: number;
   roadMax: number;
   roadIntervalMoving: number;
   roadIntervalStopped: number;
@@ -65,12 +73,33 @@ type RuntimeProfile = {
   inferenceStoppedCooldown: number;
 };
 
+type StoredVisionSession = {
+  at: number;
+  mode: TravelMode;
+  deviceId?: string;
+  hidden: boolean;
+};
+
+type StartCameraOptions = {
+  resume?: boolean;
+  forceRecovery?: boolean;
+};
+
+type StopCameraOptions = {
+  clearSession?: boolean;
+  resetUi?: boolean;
+};
+
 const VISION_SESSION_KEY = "roadguard-vision-session-v3";
+const VISION_SESSION_MAX_AGE = 4 * 60 * 60 * 1000;
 const DEFAULT_RUNTIME_PROFILE: RuntimeProfile = {
   ios: false,
   recovery: false,
   modelDevice: "auto",
+  cameraMaxWidth: 1280,
+  cameraMaxFps: 24,
   inputMax: 512,
+  overlayMax: 1920,
   roadMax: 272,
   roadIntervalMoving: 420,
   roadIntervalStopped: 700,
@@ -125,11 +154,18 @@ function captureOrientation() {
 }
 
 function cameraConstraints(
+  profile: RuntimeProfile,
   deviceId?: string,
 ): MediaTrackConstraints {
   return {
-    width: { ideal: 1280, max: 1280 },
-    frameRate: { ideal: 20, max: 24 },
+    width: {
+      ideal: profile.cameraMaxWidth,
+      max: profile.cameraMaxWidth,
+    },
+    frameRate: {
+      ideal: profile.cameraMaxFps,
+      max: profile.cameraMaxFps,
+    },
     ...(deviceId
       ? { deviceId: { exact: deviceId } }
       : { facingMode: { ideal: "environment" } }),
@@ -143,29 +179,88 @@ function isIOSDevice() {
   );
 }
 
-function hadUncleanVisionSession() {
+function browserStorage(
+  kind: "localStorage" | "sessionStorage",
+): Storage | null {
   try {
-    const raw = window.localStorage.getItem(VISION_SESSION_KEY);
-    if (!raw) return false;
-    const { at } = JSON.parse(raw) as { at?: number };
-    return typeof at === "number" && Date.now() - at < 4 * 60 * 60 * 1000;
+    return window[kind];
   } catch {
-    return false;
+    return null;
   }
 }
 
-function markVisionSession(active: boolean) {
+function readVisionSession(storage: Storage | null) {
+  if (!storage) return null;
   try {
-    if (active) {
-      window.localStorage.setItem(
-        VISION_SESSION_KEY,
-        JSON.stringify({ at: Date.now() }),
-      );
-    } else {
-      window.localStorage.removeItem(VISION_SESSION_KEY);
+    const raw = storage.getItem(VISION_SESSION_KEY);
+    if (!raw) return null;
+    const stored = JSON.parse(raw) as Partial<StoredVisionSession>;
+    if (
+      typeof stored.at !== "number" ||
+      Date.now() - stored.at >= VISION_SESSION_MAX_AGE ||
+      !["walk", "ride", "drive"].includes(stored.mode ?? "")
+    ) {
+      storage.removeItem(VISION_SESSION_KEY);
+      return null;
     }
+    return {
+      at: stored.at,
+      mode: stored.mode as TravelMode,
+      deviceId:
+        typeof stored.deviceId === "string"
+          ? stored.deviceId
+          : undefined,
+      hidden: Boolean(stored.hidden),
+    } satisfies StoredVisionSession;
   } catch {
-    // Private browsing or storage policies can disable localStorage.
+    return null;
+  }
+}
+
+function hadUncleanVisionSession() {
+  const stored = readVisionSession(browserStorage("localStorage"));
+  return Boolean(stored && !stored.hidden);
+}
+
+function readResumableVisionSession() {
+  return readVisionSession(browserStorage("sessionStorage"));
+}
+
+function saveVisionSession(
+  mode: TravelMode,
+  deviceId?: string,
+  hidden = false,
+) {
+  const serialized = JSON.stringify({
+    at: Date.now(),
+    mode,
+    deviceId,
+    hidden,
+  } satisfies StoredVisionSession);
+  for (const storage of [
+    browserStorage("localStorage"),
+    browserStorage("sessionStorage"),
+  ]) {
+    if (!storage) continue;
+    try {
+      storage.setItem(VISION_SESSION_KEY, serialized);
+    } catch {
+      // Private browsing or storage policies can disable a storage area.
+    }
+  }
+}
+
+function clearVisionSession() {
+  for (const storage of [
+    browserStorage("localStorage"),
+    browserStorage("sessionStorage"),
+  ]) {
+    if (!storage) continue;
+    try {
+      storage.removeItem(VISION_SESSION_KEY);
+    } catch {
+      // Private browsing or storage policies can disable a storage area.
+    }
   }
 }
 
@@ -176,7 +271,10 @@ function selectRuntimeProfile(recovery: boolean): RuntimeProfile {
       ios: true,
       recovery: true,
       modelDevice: "cpu",
+      cameraMaxWidth: 960,
+      cameraMaxFps: 16,
       inputMax: 320,
+      overlayMax: 960,
       roadMax: 224,
       roadIntervalMoving: 820,
       roadIntervalStopped: 1100,
@@ -189,7 +287,10 @@ function selectRuntimeProfile(recovery: boolean): RuntimeProfile {
     ios: true,
     recovery: false,
     modelDevice: "auto",
+    cameraMaxWidth: 1280,
+    cameraMaxFps: 20,
     inputMax: 384,
+    overlayMax: 1280,
     roadMax: 256,
     roadIntervalMoving: 560,
     roadIntervalStopped: 820,
@@ -246,6 +347,9 @@ export default function Home() {
   const modelRef = useRef<YoloModel | null>(null);
   const modelPromiseRef = useRef<Promise<void> | null>(null);
   const runningRef = useRef(false);
+  const activeDeviceIdRef = useRef<string | undefined>(undefined);
+  const resumeInFlightRef = useRef(false);
+  const autoResumeAttemptedRef = useRef(false);
   const cameraSessionRef = useRef(0);
   const modeRef = useRef<TravelMode>("drive");
   const soundEnabledRef = useRef(true);
@@ -259,6 +363,7 @@ export default function Home() {
   const roadSceneRef = useRef<RoadScene>(emptyRoadScene());
   const roadSceneTrackerRef = useRef(createRoadSceneTracker());
   const frameSizeRef = useRef({ width: 0, height: 0 });
+  const overlaySizeRef = useRef({ width: 0, height: 0 });
   const captureOrientationRef = useRef<
     "portrait" | "landscape" | null
   >(null);
@@ -304,7 +409,8 @@ export default function Home() {
   const [speedKmh, setSpeedKmh] = useState(0);
 
   const currentMode = MODES[mode];
-  const isRunning = cameraState === "running";
+  const isRunning =
+    cameraState === "running" || cameraState === "resuming";
 
   const modeEntries = useMemo(
     () => Object.entries(MODES) as [TravelMode, (typeof MODES)[TravelMode]][],
@@ -325,6 +431,11 @@ export default function Home() {
     setControlsVisible(true);
     if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
     if (runningRef.current) {
+      saveVisionSession(
+        nextMode,
+        activeDeviceIdRef.current,
+        document.hidden,
+      );
       hideTimerRef.current = setTimeout(
         () => setControlsVisible(false),
         5000,
@@ -572,18 +683,23 @@ export default function Home() {
     );
   }, []);
 
-  const stopCamera = useCallback(() => {
+  const stopCamera = useCallback((options: StopCameraOptions = {}) => {
+    const {
+      clearSession = true,
+      resetUi = true,
+    } = options;
     runningRef.current = false;
     cameraSessionRef.current += 1;
     if (visionHeartbeatRef.current) {
       clearInterval(visionHeartbeatRef.current);
       visionHeartbeatRef.current = null;
     }
-    markVisionSession(false);
+    if (clearSession) clearVisionSession();
     if (animationRef.current) cancelAnimationFrame(animationRef.current);
     animationRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+    if (clearSession) activeDeviceIdRef.current = undefined;
     stopLocationTracking();
     void wakeLockRef.current?.release();
     wakeLockRef.current = null;
@@ -591,6 +707,11 @@ export default function Home() {
     roadSceneRef.current = emptyRoadScene();
     roadSceneTrackerRef.current = createRoadSceneTracker();
     frameSizeRef.current = { width: 0, height: 0 };
+    overlaySizeRef.current = { width: 0, height: 0 };
+    if (canvasRef.current) {
+      canvasRef.current.width = 1;
+      canvasRef.current.height = 1;
+    }
     inferenceErrorCountRef.current = 0;
     statsRef.current = { startedAt: 0, frames: 0 };
     alertRef.current = null;
@@ -599,7 +720,7 @@ export default function Home() {
     setAlert(null);
     setDetectedCount(0);
     setFps(0);
-    setCameraState("idle");
+    if (resetUi) setCameraState("idle");
   }, [stopLocationTracking]);
 
   const captureCurrentFrame = useCallback(() => {
@@ -791,18 +912,29 @@ export default function Home() {
         const canvas = canvasRef.current;
         if (video && canvas && video.videoWidth && video.videoHeight) {
           const profile = runtimeProfileRef.current;
-          const dimensions = visionFrameSize(
+          const analysisDimensions = visionFrameSize(
             video.videoWidth,
             video.videoHeight,
             profile.inputMax,
           );
-          const dimensionsChanged =
-            frameSizeRef.current.width !== dimensions.width ||
-            frameSizeRef.current.height !== dimensions.height;
-          if (dimensionsChanged) {
-            frameSizeRef.current = dimensions;
-            canvas.width = dimensions.width;
-            canvas.height = dimensions.height;
+          const overlayDimensions = visionFrameSize(
+            video.videoWidth,
+            video.videoHeight,
+            profile.overlayMax,
+          );
+          const analysisDimensionsChanged =
+            frameSizeRef.current.width !== analysisDimensions.width ||
+            frameSizeRef.current.height !== analysisDimensions.height;
+          const overlayDimensionsChanged =
+            overlaySizeRef.current.width !== overlayDimensions.width ||
+            overlaySizeRef.current.height !== overlayDimensions.height;
+          if (overlayDimensionsChanged) {
+            overlaySizeRef.current = overlayDimensions;
+            canvas.width = overlayDimensions.width;
+            canvas.height = overlayDimensions.height;
+          }
+          if (analysisDimensionsChanged) {
+            frameSizeRef.current = analysisDimensions;
             trackStoreRef.current = { nextId: 1, tracks: new Map() };
             roadSceneRef.current = emptyRoadScene(elapsed);
             roadSceneTrackerRef.current = createRoadSceneTracker();
@@ -872,6 +1004,8 @@ export default function Home() {
               detectionsRef.current,
               alertRef.current,
               roadSceneRef.current,
+              analysisDimensions.width,
+              analysisDimensions.height,
             );
           }
         }
@@ -898,7 +1032,10 @@ export default function Home() {
   }, []);
 
   const startCamera = useCallback(
-    async (deviceId?: string) => {
+    async (
+      deviceId?: string,
+      options: StartCameraOptions = {},
+    ) => {
       if (!navigator.mediaDevices?.getUserMedia) {
         setErrorMessage("Safari รุ่นนี้ไม่รองรับการเปิดกล้องผ่านเว็บ");
         setCameraState("error");
@@ -906,8 +1043,9 @@ export default function Home() {
       }
 
       await unlockAudio();
-      const recovery =
-        recoveryCheckedRef.current ?? hadUncleanVisionSession();
+      const recovery = options.forceRecovery
+        ? true
+        : (recoveryCheckedRef.current ?? hadUncleanVisionSession());
       recoveryCheckedRef.current = recovery;
       const profile = selectRuntimeProfile(recovery);
       runtimeProfileRef.current = profile;
@@ -918,22 +1056,35 @@ export default function Home() {
             ? "เสถียร"
             : "",
       );
-      stopCamera();
+      stopCamera({ clearSession: false, resetUi: false });
       const session = ++cameraSessionRef.current;
       lastInferenceAtRef.current = 0;
       lastOverlayAtRef.current = 0;
       lastRoadAnalysisAtRef.current = 0;
       inferenceIntervalRef.current = 0;
       inferenceErrorCountRef.current = 0;
-      setCameraState("requesting");
+      setCameraState(options.resume ? "resuming" : "requesting");
       setErrorMessage("");
+      if (
+        recovery &&
+        options.forceRecovery &&
+        modelRef.current?.device === "webgpu" &&
+        !inferenceBusyRef.current
+      ) {
+        modelRef.current.free();
+        modelRef.current = null;
+        modelPromiseRef.current = null;
+        setModelBackend("");
+        setModelProgress(0);
+        setModelState("idle");
+      }
       void loadYolo().catch(() => undefined);
       try {
         const orientation = captureOrientation();
         captureOrientationRef.current = orientation;
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: false,
-          video: cameraConstraints(deviceId),
+          video: cameraConstraints(profile, deviceId),
         });
         if (session !== cameraSessionRef.current) {
           stream.getTracks().forEach((track) => track.stop());
@@ -942,6 +1093,8 @@ export default function Home() {
         streamRef.current = stream;
         const cameraTrack = stream.getVideoTracks()[0];
         if (cameraTrack) await resetCameraZoom(cameraTrack);
+        activeDeviceIdRef.current =
+          cameraTrack?.getSettings().deviceId || deviceId;
         const video = videoRef.current;
         if (!video) throw new Error("camera-view-missing");
         video.srcObject = stream;
@@ -950,9 +1103,18 @@ export default function Home() {
         await refreshCameraList();
         await requestWakeLock();
         runningRef.current = true;
-        markVisionSession(true);
+        saveVisionSession(
+          modeRef.current,
+          activeDeviceIdRef.current,
+          false,
+        );
         visionHeartbeatRef.current = setInterval(
-          () => markVisionSession(true),
+          () =>
+            saveVisionSession(
+              modeRef.current,
+              activeDeviceIdRef.current,
+              document.hidden,
+            ),
           15000,
         );
         setCameraState("running");
@@ -964,9 +1126,11 @@ export default function Home() {
         beginVisionLoop(session);
       } catch (error) {
         console.error(error);
-        stopCamera();
+        stopCamera({ clearSession: true, resetUi: false });
         setErrorMessage(
-          "เปิดกล้องไม่ได้ กรุณาอนุญาต Camera ใน Safari แล้วลองอีกครั้ง",
+          options.resume
+            ? "Safari หยุดกล้องชั่วคราว แตะเพื่อกลับมาใช้งานต่อ"
+            : "เปิดกล้องไม่ได้ กรุณาอนุญาต Camera ใน Safari แล้วลองอีกครั้ง",
         );
         setCameraState("error");
       }
@@ -986,7 +1150,7 @@ export default function Home() {
     if (cameras.length < 2) return;
     const nextIndex = (cameraIndex + 1) % cameras.length;
     setCameraIndex(nextIndex);
-    await startCamera(cameras[nextIndex]?.deviceId);
+    await startCamera(cameras[nextIndex]?.deviceId, { resume: true });
   }, [cameraIndex, cameras, startCamera]);
 
   const toggleSound = useCallback(async () => {
@@ -1031,18 +1195,104 @@ export default function Home() {
     }
   }, []);
 
+  const restoreCameraAfterVisibility = useCallback(async () => {
+    if (
+      document.hidden ||
+      !runningRef.current ||
+      resumeInFlightRef.current
+    ) {
+      return;
+    }
+
+    saveVisionSession(
+      modeRef.current,
+      activeDeviceIdRef.current,
+      false,
+    );
+    await requestWakeLock();
+
+    const track = streamRef.current?.getVideoTracks()[0];
+    const video = videoRef.current;
+    if (track?.readyState === "live" && video) {
+      try {
+        if (video.srcObject !== streamRef.current) {
+          video.srcObject = streamRef.current;
+        }
+        if (video.paused) await video.play();
+        return;
+      } catch {
+        // Restart the stream below if iOS did not restore playback.
+      }
+    }
+
+    resumeInFlightRef.current = true;
+    try {
+      await startCamera(activeDeviceIdRef.current, {
+        resume: true,
+        forceRecovery: true,
+      });
+    } finally {
+      resumeInFlightRef.current = false;
+    }
+  }, [requestWakeLock, startCamera]);
+
   useEffect(() => {
     const onVisibilityChange = () => {
-      if (!document.hidden && runningRef.current) void requestWakeLock();
+      if (document.hidden) {
+        if (runningRef.current) {
+          saveVisionSession(
+            modeRef.current,
+            activeDeviceIdRef.current,
+            true,
+          );
+        }
+        return;
+      }
+      void restoreCameraAfterVisibility();
     };
-    const onPageHide = () => stopCamera();
+    const onPageHide = () => {
+      if (runningRef.current) {
+        saveVisionSession(
+          modeRef.current,
+          activeDeviceIdRef.current,
+          true,
+        );
+      }
+    };
+    const onPageShow = () => {
+      void restoreCameraAfterVisibility();
+    };
     document.addEventListener("visibilitychange", onVisibilityChange);
     window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("pageshow", onPageShow);
     return () => {
       document.removeEventListener("visibilitychange", onVisibilityChange);
       window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("pageshow", onPageShow);
     };
-  }, [requestWakeLock, stopCamera]);
+  }, [restoreCameraAfterVisibility]);
+
+  useEffect(() => {
+    const stored = readResumableVisionSession();
+    if (!stored) return;
+
+    const timer = window.setTimeout(() => {
+      if (autoResumeAttemptedRef.current || runningRef.current) return;
+      autoResumeAttemptedRef.current = true;
+      recoveryCheckedRef.current = true;
+      modeRef.current = stored.mode;
+      setMode(stored.mode);
+      resumeInFlightRef.current = true;
+      void startCamera(stored.deviceId, {
+        resume: true,
+        forceRecovery: true,
+      }).finally(() => {
+        resumeInFlightRef.current = false;
+      });
+    }, 0);
+
+    return () => window.clearTimeout(timer);
+  }, [startCamera]);
 
   useEffect(() => {
     const applyOrientation = () => {
@@ -1085,7 +1335,14 @@ export default function Home() {
 
   useEffect(
     () => () => {
-      stopCamera();
+      if (runningRef.current) {
+        saveVisionSession(
+          modeRef.current,
+          activeDeviceIdRef.current,
+          true,
+        );
+      }
+      stopCamera({ clearSession: false, resetUi: false });
       if (!inferenceBusyRef.current) modelRef.current?.free();
       modelRef.current = null;
       modelPromiseRef.current = null;
@@ -1095,7 +1352,9 @@ export default function Home() {
   );
 
   const liveStatus =
-    modelState === "ready"
+    cameraState === "resuming"
+      ? "กำลังกู้คืนกล้อง…"
+      : modelState === "ready"
       ? `${modelBackend === "webgpu" ? "GPU" : "CPU"} • ${fps ? fps.toFixed(1) : "—"} FPS${runtimeLabel ? ` • ${runtimeLabel}` : ""}`
       : modelState === "loading"
         ? `โหลด YOLO ${modelProgress}%`
@@ -1395,7 +1654,7 @@ export default function Home() {
               <li>ภาพจะแสดงครบทั้งเฟรมที่กล้องส่งมา จึงอาจมีขอบดำเมื่อสัดส่วนหน้าจอไม่ตรงกับกล้อง</li>
               <li>เส้นเลนจะแสดงเฉพาะเมื่อพบขอบเลนซ้ายและขวาด้วยความมั่นใจเพียงพอ</li>
               <li>พื้นที่ใต้ขอบตัวรถที่ตรวจพบจะถูกตัดออก เพื่อลดการตรวจคอนโซลผิดเป็นวัตถุ</li>
-              <li>บน iPhone ระบบจำกัดเฟรมและจะสลับเป็น CPU โหมดกู้คืนอัตโนมัติหลังการปิดหน้าผิดปกติ</li>
+              <li>เมื่อ Safari พักหรือโหลดหน้าใหม่ ระบบจะพยายามกลับมาใช้กล้องต่อและลดภาระเป็นโหมดกู้คืนอัตโนมัติ</li>
               <li>บน iPhone ใช้ แชร์ → เพิ่มไปยังหน้าจอโฮม เพื่อเปิดแบบเต็มจอ</li>
             </ul>
             <div className="privacy-box">

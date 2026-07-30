@@ -1031,7 +1031,7 @@ function drawCornerBox(
     context.stroke();
   }
 
-  const fontSize = clamp(width / 44, 8, 18);
+  const fontSize = clamp(width / 44, 10, 20);
   context.font = `700 ${fontSize}px "Noto Sans Thai", "Thonburi", sans-serif`;
   const distance = formatDistance(detection.distance);
   const text = `${detection.thaiName}  ${distance}`;
@@ -1091,12 +1091,28 @@ export function renderVisionOverlay(
   detections: AnalyzedDetection[],
   alert: VisionAlert | null,
   roadScene: RoadScene | null,
+  sourceWidth: number,
+  sourceHeight: number,
 ) {
   const context = canvas.getContext("2d");
   if (!context) return;
-  const width = canvas.width;
-  const height = canvas.height;
-  context.clearRect(0, 0, width, height);
+  const outputWidth = canvas.width;
+  const outputHeight = canvas.height;
+  const width = Math.max(1, sourceWidth);
+  const height = Math.max(1, sourceHeight);
+
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  context.clearRect(0, 0, outputWidth, outputHeight);
+  context.imageSmoothingEnabled = true;
+  context.save();
+  context.setTransform(
+    outputWidth / width,
+    0,
+    0,
+    outputHeight / height,
+    0,
+    0,
+  );
   drawRoadScene(
     context,
     width,
@@ -1109,4 +1125,5 @@ export function renderVisionOverlay(
   detections.forEach((detection) =>
     drawCornerBox(context, detection, width, height),
   );
+  context.restore();
 }
