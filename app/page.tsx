@@ -280,13 +280,13 @@ function selectRuntimeProfile(recovery: boolean): RuntimeProfile {
       recovery: true,
       modelDevice: "cpu",
       cameraMaxWidth: 720,
-      cameraMaxFps: 12,
+      cameraMaxFps: 16,
       inputMax: 256,
       overlayMax: 960,
       roadMax: 192,
-      roadIntervalMoving: 1000,
-      roadIntervalStopped: 1400,
-      overlayInterval: 110,
+      roadIntervalMoving: 240,
+      roadIntervalStopped: 380,
+      overlayInterval: 66,
       inferenceMovingCooldown: 1200,
       inferenceStoppedCooldown: 1700,
     };
@@ -296,13 +296,13 @@ function selectRuntimeProfile(recovery: boolean): RuntimeProfile {
     recovery: false,
     modelDevice: "cpu",
     cameraMaxWidth: 960,
-    cameraMaxFps: 16,
+    cameraMaxFps: 20,
     inputMax: 320,
     overlayMax: 1280,
     roadMax: 224,
-    roadIntervalMoving: 720,
-    roadIntervalStopped: 1000,
-    overlayInterval: 80,
+    roadIntervalMoving: 180,
+    roadIntervalStopped: 300,
+    overlayInterval: 50,
     inferenceMovingCooldown: 760,
     inferenceStoppedCooldown: 1100,
   };
@@ -412,6 +412,7 @@ export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const inferenceCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const roadCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animationRef = useRef<number | null>(null);
   const geolocationWatchRef = useRef<number | null>(null);
@@ -826,6 +827,14 @@ export default function Home() {
       canvasRef.current.width = 1;
       canvasRef.current.height = 1;
     }
+    for (const offscreen of [
+      inferenceCanvasRef.current,
+      roadCanvasRef.current,
+    ]) {
+      if (!offscreen) continue;
+      offscreen.width = 1;
+      offscreen.height = 1;
+    }
     inferenceErrorCountRef.current = 0;
     statsRef.current = { startedAt: 0, frames: 0 };
     alertRef.current = null;
@@ -837,51 +846,67 @@ export default function Home() {
     if (resetUi) setCameraState("idle");
   }, [stopLocationTracking]);
 
-  const captureCurrentFrame = useCallback(() => {
-    const video = videoRef.current;
-    if (
-      !video ||
-      video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
-      !video.videoWidth ||
-      !video.videoHeight
-    ) {
-      return null;
-    }
+  const captureCurrentFrame = useCallback(
+    (
+      maxDimension: number,
+      target: "inference" | "road",
+    ) => {
+      const video = videoRef.current;
+      if (
+        !video ||
+        video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+        !video.videoWidth ||
+        !video.videoHeight
+      ) {
+        return null;
+      }
 
-    const dimensions = visionFrameSize(
-      video.videoWidth,
-      video.videoHeight,
-      runtimeProfileRef.current.inputMax,
-    );
-    const inferenceCanvas =
-      inferenceCanvasRef.current ?? document.createElement("canvas");
-    inferenceCanvasRef.current = inferenceCanvas;
-    if (
-      inferenceCanvas.width !== dimensions.width ||
-      inferenceCanvas.height !== dimensions.height
-    ) {
-      inferenceCanvas.width = dimensions.width;
-      inferenceCanvas.height = dimensions.height;
-    }
-    const context = inferenceCanvas.getContext("2d", {
-      alpha: false,
-      willReadFrequently: true,
-    });
-    if (!context) return null;
-    context.drawImage(
-      video,
-      0,
-      0,
-      dimensions.width,
-      dimensions.height,
-    );
-    return context.getImageData(
-      0,
-      0,
-      dimensions.width,
-      dimensions.height,
-    );
-  }, []);
+      const dimensions = visionFrameSize(
+        video.videoWidth,
+        video.videoHeight,
+        maxDimension,
+      );
+      const currentCanvas =
+        target === "inference"
+          ? inferenceCanvasRef.current
+          : roadCanvasRef.current;
+      let frameCanvas = currentCanvas;
+      if (
+        !frameCanvas ||
+        frameCanvas.width !== dimensions.width ||
+        frameCanvas.height !== dimensions.height
+      ) {
+        const nextCanvas = document.createElement("canvas");
+        nextCanvas.width = dimensions.width;
+        nextCanvas.height = dimensions.height;
+        frameCanvas = nextCanvas;
+        if (target === "inference") {
+          inferenceCanvasRef.current = nextCanvas;
+        } else {
+          roadCanvasRef.current = nextCanvas;
+        }
+      }
+      const context = frameCanvas.getContext("2d", {
+        alpha: false,
+        willReadFrequently: true,
+      });
+      if (!context) return null;
+      context.drawImage(
+        video,
+        0,
+        0,
+        dimensions.width,
+        dimensions.height,
+      );
+      return context.getImageData(
+        0,
+        0,
+        dimensions.width,
+        dimensions.height,
+      );
+    },
+    [],
+  );
 
   const runInference = useCallback(
     async (session: number, frame: ImageData) => {
@@ -1073,36 +1098,47 @@ export default function Home() {
             elapsed - lastInferenceAtRef.current >=
               inferenceIntervalRef.current;
 
-          if (
-            !inferenceBusyRef.current &&
-            (roadDue || inferenceDue)
-          ) {
+          if (roadDue) {
+            lastRoadAnalysisAtRef.current = elapsed;
             try {
-              const captured = captureCurrentFrame();
-              if (captured) {
-                if (roadDue) {
-                  lastRoadAnalysisAtRef.current = elapsed;
-                  roadSceneRef.current = analyzeRoadSceneScaled(
-                    captured.data,
-                    captured.width,
-                    captured.height,
-                    roadSceneTrackerRef.current,
-                    elapsed,
-                    profile.roadMax,
-                  );
-                }
-                if (inferenceDue) {
-                  lastInferenceAtRef.current = elapsed;
-                  void runInference(session, captured);
-                }
+              const roadFrame = captureCurrentFrame(
+                profile.roadMax,
+                "road",
+              );
+              if (roadFrame) {
+                roadSceneRef.current = analyzeRoadSceneScaled(
+                  roadFrame.data,
+                  roadFrame.width,
+                  roadFrame.height,
+                  roadSceneTrackerRef.current,
+                  elapsed,
+                  profile.roadMax,
+                );
               }
             } catch (error) {
-              console.warn("Vision frame capture failed", error);
-              if (roadDue) {
-                lastRoadAnalysisAtRef.current = elapsed;
+              console.warn("Road frame capture failed", error);
+              if (
+                elapsed - roadSceneRef.current.analyzedAt >
+                roadInterval * 3
+              ) {
                 roadSceneRef.current = emptyRoadScene(elapsed);
                 roadSceneTrackerRef.current = createRoadSceneTracker();
               }
+            }
+          }
+
+          if (inferenceDue && !inferenceBusyRef.current) {
+            try {
+              const inferenceFrame = captureCurrentFrame(
+                profile.inputMax,
+                "inference",
+              );
+              if (inferenceFrame) {
+                lastInferenceAtRef.current = elapsed;
+                void runInference(session, inferenceFrame);
+              }
+            } catch (error) {
+              console.warn("Inference frame capture failed", error);
             }
           }
 

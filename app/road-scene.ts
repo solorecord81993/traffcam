@@ -664,14 +664,14 @@ function stabilizeLane(
   tracker.lane = consistent
     ? {
         left: {
-          points: blendPoints(raw.left.points, previous.left.points, 0.4),
+          points: blendPoints(raw.left.points, previous.left.points, 0.58),
         },
         right: {
-          points: blendPoints(raw.right.points, previous.right.points, 0.4),
+          points: blendPoints(raw.right.points, previous.right.points, 0.58),
         },
-        topY: interpolate(previous.topY, raw.topY, 0.4),
-        bottomY: interpolate(previous.bottomY, raw.bottomY, 0.4),
-        confidence: interpolate(previous.confidence, raw.confidence, 0.45),
+        topY: interpolate(previous.topY, raw.topY, 0.58),
+        bottomY: interpolate(previous.bottomY, raw.bottomY, 0.58),
+        confidence: interpolate(previous.confidence, raw.confidence, 0.52),
       }
     : raw;
   return tracker.laneEvidence >= 2 ? tracker.lane : null;
