@@ -1,0 +1,5 @@
+.next
+node_modules
+public/models/*.onnx
+public/models/*.download
+*.log

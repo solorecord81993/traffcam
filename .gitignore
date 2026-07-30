@@ -1,0 +1,22 @@
+# dependencies
+/node_modules
+
+# Next.js
+/.next
+/out
+
+# local environment
+.env*
+!.env.example
+
+# Vercel
+/.vercel
+
+# generated model (downloaded and verified during build)
+/public/models/*.onnx
+/public/models/*.download
+
+# tooling
+*.log
+.DS_Store
+*.tsbuildinfo
