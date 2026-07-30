@@ -281,6 +281,103 @@ button:focus-visible {
   font-weight: 530;
 }
 
+.boot-panel {
+  display: grid;
+  place-items: center;
+}
+
+.boot-panel .loader-ring {
+  margin-bottom: 18px;
+}
+
+.boot-panel h1 {
+  font-size: clamp(27px, 8vw, 40px);
+  letter-spacing: -0.045em;
+}
+
+.boot-panel .lead {
+  margin-bottom: 0;
+}
+
+.resume-panel {
+  position: absolute;
+  z-index: 22;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  width: min(calc(100% - 34px), 390px);
+  justify-items: center;
+  gap: 15px;
+  padding: 24px 20px 18px;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgba(116, 247, 197, 0.24);
+  border-radius: 25px;
+  background: rgba(5, 12, 17, 0.9);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.46);
+  text-align: center;
+  -webkit-backdrop-filter: blur(24px);
+  backdrop-filter: blur(24px);
+}
+
+.resume-icon {
+  display: grid;
+  width: 54px;
+  height: 54px;
+  place-items: center;
+  color: #06110e;
+  border-radius: 18px;
+  background: #74f7c5;
+  box-shadow: 0 10px 30px rgba(80, 233, 182, 0.2);
+}
+
+.resume-panel > div {
+  display: grid;
+  gap: 7px;
+}
+
+.resume-panel strong {
+  color: #f8fbfd;
+  font-size: 17px;
+  letter-spacing: -0.025em;
+}
+
+.resume-panel p {
+  margin: 0;
+  color: #9ba9b4;
+  font-size: 12px;
+  line-height: 1.65;
+  text-wrap: balance;
+}
+
+.resume-button {
+  display: flex;
+  width: 100%;
+  min-height: 54px;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  border: 0;
+  border-radius: 17px;
+  background: linear-gradient(135deg, #8dffdb, #52e9b7);
+  color: #06110e;
+  font-size: 14px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.resume-button:active {
+  transform: scale(0.985);
+}
+
+.resume-cancel {
+  padding: 5px 10px;
+  border: 0;
+  background: transparent;
+  color: #7f8e99;
+  font-size: 11px;
+  cursor: pointer;
+}
+
 .lead {
   width: min(92%, 390px);
   margin: 20px auto 26px;

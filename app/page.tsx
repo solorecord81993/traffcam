@@ -46,6 +46,7 @@ type CameraState =
   | "idle"
   | "requesting"
   | "resuming"
+  | "paused"
   | "running"
   | "error";
 type ModelState = "idle" | "loading" | "ready" | "error";
@@ -167,7 +168,10 @@ function cameraConstraints(
       max: profile.cameraMaxFps,
     },
     ...(deviceId
-      ? { deviceId: { exact: deviceId } }
+      ? {
+          deviceId: { ideal: deviceId },
+          facingMode: { ideal: "environment" },
+        }
       : { facingMode: { ideal: "environment" } }),
   };
 }
@@ -223,7 +227,10 @@ function hadUncleanVisionSession() {
 }
 
 function readResumableVisionSession() {
-  return readVisionSession(browserStorage("sessionStorage"));
+  return (
+    readVisionSession(browserStorage("sessionStorage")) ??
+    readVisionSession(browserStorage("localStorage"))
+  );
 }
 
 function saveVisionSession(
@@ -271,33 +278,66 @@ function selectRuntimeProfile(recovery: boolean): RuntimeProfile {
       ios: true,
       recovery: true,
       modelDevice: "cpu",
-      cameraMaxWidth: 960,
-      cameraMaxFps: 16,
-      inputMax: 320,
+      cameraMaxWidth: 720,
+      cameraMaxFps: 12,
+      inputMax: 256,
       overlayMax: 960,
-      roadMax: 224,
-      roadIntervalMoving: 820,
-      roadIntervalStopped: 1100,
-      overlayInterval: 90,
-      inferenceMovingCooldown: 850,
-      inferenceStoppedCooldown: 1250,
+      roadMax: 192,
+      roadIntervalMoving: 1000,
+      roadIntervalStopped: 1400,
+      overlayInterval: 110,
+      inferenceMovingCooldown: 1200,
+      inferenceStoppedCooldown: 1700,
     };
   }
   return {
     ios: true,
     recovery: false,
-    modelDevice: "auto",
-    cameraMaxWidth: 1280,
-    cameraMaxFps: 20,
-    inputMax: 384,
+    modelDevice: "cpu",
+    cameraMaxWidth: 960,
+    cameraMaxFps: 16,
+    inputMax: 320,
     overlayMax: 1280,
-    roadMax: 256,
-    roadIntervalMoving: 560,
-    roadIntervalStopped: 820,
-    overlayInterval: 66,
-    inferenceMovingCooldown: 460,
-    inferenceStoppedCooldown: 760,
+    roadMax: 224,
+    roadIntervalMoving: 720,
+    roadIntervalStopped: 1000,
+    overlayInterval: 80,
+    inferenceMovingCooldown: 760,
+    inferenceStoppedCooldown: 1100,
   };
+}
+
+async function requestCameraStream(
+  profile: RuntimeProfile,
+  deviceId?: string,
+) {
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: cameraConstraints(profile, deviceId),
+    });
+  } catch (error) {
+    const name =
+      error && typeof error === "object" && "name" in error
+        ? String(error.name)
+        : "";
+    const canRetryWithoutStoredDevice =
+      Boolean(deviceId) &&
+      [
+        "AbortError",
+        "ConstraintNotSatisfiedError",
+        "DevicesNotFoundError",
+        "NotFoundError",
+        "NotReadableError",
+        "OverconstrainedError",
+        "TrackStartError",
+      ].includes(name);
+    if (!canRetryWithoutStoredDevice) throw error;
+    return navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: cameraConstraints(profile),
+    });
+  }
 }
 
 function visionFrameSize(
@@ -344,6 +384,9 @@ export default function Home() {
   );
   const wakeLockRef = useRef<{ release: () => Promise<void> } | null>(null);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const backgroundReleaseTimerRef = useRef<ReturnType<
+    typeof setTimeout
+  > | null>(null);
   const modelRef = useRef<YoloModel | null>(null);
   const modelPromiseRef = useRef<Promise<void> | null>(null);
   const runningRef = useRef(false);
@@ -407,10 +450,13 @@ export default function Home() {
   const [alert, setAlert] = useState<VisionAlert | null>(null);
   const [gpsState, setGpsState] = useState<GpsState>("idle");
   const [speedKmh, setSpeedKmh] = useState(0);
+  const [sessionChecked, setSessionChecked] = useState(false);
 
   const currentMode = MODES[mode];
   const isRunning =
-    cameraState === "running" || cameraState === "resuming";
+    cameraState === "running" ||
+    cameraState === "resuming" ||
+    cameraState === "paused";
 
   const modeEntries = useMemo(
     () => Object.entries(MODES) as [TravelMode, (typeof MODES)[TravelMode]][],
@@ -592,6 +638,38 @@ export default function Home() {
     modelPromiseRef.current = task;
     return task;
   }, []);
+
+  const releaseYoloForBackground = useCallback(() => {
+    const model = modelRef.current;
+    if (!model || inferenceBusyRef.current) return false;
+    model.free();
+    modelRef.current = null;
+    modelPromiseRef.current = null;
+    setModelBackend("");
+    setModelProgress(0);
+    setModelState("idle");
+    return true;
+  }, []);
+
+  const scheduleYoloRelease = useCallback(() => {
+    if (!isIOSDevice()) return;
+    if (backgroundReleaseTimerRef.current) {
+      clearTimeout(backgroundReleaseTimerRef.current);
+      backgroundReleaseTimerRef.current = null;
+    }
+    let attempts = 0;
+    const releaseWhenIdle = () => {
+      backgroundReleaseTimerRef.current = null;
+      if (!document.hidden || releaseYoloForBackground()) return;
+      attempts += 1;
+      if (attempts >= 8) return;
+      backgroundReleaseTimerRef.current = setTimeout(
+        releaseWhenIdle,
+        250,
+      );
+    };
+    releaseWhenIdle();
+  }, [releaseYoloForBackground]);
 
   const requestWakeLock = useCallback(async () => {
     try {
@@ -1066,8 +1144,7 @@ export default function Home() {
       setCameraState(options.resume ? "resuming" : "requesting");
       setErrorMessage("");
       if (
-        recovery &&
-        options.forceRecovery &&
+        profile.modelDevice === "cpu" &&
         modelRef.current?.device === "webgpu" &&
         !inferenceBusyRef.current
       ) {
@@ -1078,14 +1155,10 @@ export default function Home() {
         setModelProgress(0);
         setModelState("idle");
       }
-      void loadYolo().catch(() => undefined);
       try {
         const orientation = captureOrientation();
         captureOrientationRef.current = orientation;
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: false,
-          video: cameraConstraints(profile, deviceId),
-        });
+        const stream = await requestCameraStream(profile, deviceId);
         if (session !== cameraSessionRef.current) {
           stream.getTracks().forEach((track) => track.stop());
           return;
@@ -1103,6 +1176,7 @@ export default function Home() {
         await refreshCameraList();
         await requestWakeLock();
         runningRef.current = true;
+        void loadYolo().catch(() => undefined);
         saveVisionSession(
           modeRef.current,
           activeDeviceIdRef.current,
@@ -1126,13 +1200,24 @@ export default function Home() {
         beginVisionLoop(session);
       } catch (error) {
         console.error(error);
-        stopCamera({ clearSession: true, resetUi: false });
-        setErrorMessage(
-          options.resume
-            ? "Safari หยุดกล้องชั่วคราว แตะเพื่อกลับมาใช้งานต่อ"
-            : "เปิดกล้องไม่ได้ กรุณาอนุญาต Camera ใน Safari แล้วลองอีกครั้ง",
-        );
-        setCameraState("error");
+        if (options.resume) {
+          stopCamera({ clearSession: false, resetUi: false });
+          saveVisionSession(
+            modeRef.current,
+            activeDeviceIdRef.current,
+            false,
+          );
+          setErrorMessage(
+            "Safari ต้องให้แตะหน้าจอหนึ่งครั้งเพื่อเปิดกล้องต่อ",
+          );
+          setCameraState("paused");
+        } else {
+          stopCamera({ clearSession: true, resetUi: false });
+          setErrorMessage(
+            "เปิดกล้องไม่ได้ กรุณาอนุญาต Camera ใน Safari แล้วลองอีกครั้ง",
+          );
+          setCameraState("error");
+        }
       }
     },
     [
@@ -1152,6 +1237,25 @@ export default function Home() {
     setCameraIndex(nextIndex);
     await startCamera(cameras[nextIndex]?.deviceId, { resume: true });
   }, [cameraIndex, cameras, startCamera]);
+
+  const resumeCamera = useCallback(async () => {
+    if (resumeInFlightRef.current) return;
+    resumeInFlightRef.current = true;
+    try {
+      await startCamera(activeDeviceIdRef.current, {
+        resume: true,
+        forceRecovery: true,
+      });
+    } finally {
+      resumeInFlightRef.current = false;
+    }
+  }, [startCamera]);
+
+  const cancelResume = useCallback(() => {
+    recoveryCheckedRef.current = null;
+    setErrorMessage("");
+    stopCamera();
+  }, [stopCamera]);
 
   const toggleSound = useCallback(async () => {
     const next = !soundEnabledRef.current;
@@ -1219,6 +1323,7 @@ export default function Home() {
           video.srcObject = streamRef.current;
         }
         if (video.paused) await video.play();
+        void loadYolo().catch(() => undefined);
         return;
       } catch {
         // Restart the stream below if iOS did not restore playback.
@@ -1234,7 +1339,7 @@ export default function Home() {
     } finally {
       resumeInFlightRef.current = false;
     }
-  }, [requestWakeLock, startCamera]);
+  }, [loadYolo, requestWakeLock, startCamera]);
 
   useEffect(() => {
     const onVisibilityChange = () => {
@@ -1246,7 +1351,12 @@ export default function Home() {
             true,
           );
         }
+        scheduleYoloRelease();
         return;
+      }
+      if (backgroundReleaseTimerRef.current) {
+        clearTimeout(backgroundReleaseTimerRef.current);
+        backgroundReleaseTimerRef.current = null;
       }
       void restoreCameraAfterVisibility();
     };
@@ -1258,6 +1368,7 @@ export default function Home() {
           true,
         );
       }
+      scheduleYoloRelease();
     };
     const onPageShow = () => {
       void restoreCameraAfterVisibility();
@@ -1270,18 +1381,26 @@ export default function Home() {
       window.removeEventListener("pagehide", onPageHide);
       window.removeEventListener("pageshow", onPageShow);
     };
-  }, [restoreCameraAfterVisibility]);
+  }, [restoreCameraAfterVisibility, scheduleYoloRelease]);
 
   useEffect(() => {
-    const stored = readResumableVisionSession();
-    if (!stored) return;
-
     const timer = window.setTimeout(() => {
-      if (autoResumeAttemptedRef.current || runningRef.current) return;
+      const stored = readResumableVisionSession();
+      if (!stored) {
+        setSessionChecked(true);
+        return;
+      }
+      if (autoResumeAttemptedRef.current || runningRef.current) {
+        setSessionChecked(true);
+        return;
+      }
       autoResumeAttemptedRef.current = true;
+      activeDeviceIdRef.current = stored.deviceId;
       recoveryCheckedRef.current = true;
       modeRef.current = stored.mode;
       setMode(stored.mode);
+      setCameraState("resuming");
+      setSessionChecked(true);
       resumeInFlightRef.current = true;
       void startCamera(stored.deviceId, {
         resume: true,
@@ -1343,6 +1462,10 @@ export default function Home() {
         );
       }
       stopCamera({ clearSession: false, resetUi: false });
+      if (backgroundReleaseTimerRef.current) {
+        clearTimeout(backgroundReleaseTimerRef.current);
+        backgroundReleaseTimerRef.current = null;
+      }
       if (!inferenceBusyRef.current) modelRef.current?.free();
       modelRef.current = null;
       modelPromiseRef.current = null;
@@ -1352,7 +1475,9 @@ export default function Home() {
   );
 
   const liveStatus =
-    cameraState === "resuming"
+    cameraState === "paused"
+      ? "รอแตะเพื่อเปิดกล้องต่อ"
+      : cameraState === "resuming"
       ? "กำลังกู้คืนกล้อง…"
       : modelState === "ready"
       ? `${modelBackend === "webgpu" ? "GPU" : "CPU"} • ${fps ? fps.toFixed(1) : "—"} FPS${runtimeLabel ? ` • ${runtimeLabel}` : ""}`
@@ -1430,7 +1555,17 @@ export default function Home() {
         )}
       </header>
 
-      {!isRunning && (
+      {!sessionChecked && (
+        <section className="welcome-panel boot-panel" role="status">
+          <span className="loader-ring">
+            <LoaderCircle className="spin" size={25} />
+          </span>
+          <h1>กำลังคืนสถานะ</h1>
+          <p className="lead">ตรวจสอบกล้องและโหมดล่าสุดบนเครื่องนี้</p>
+        </section>
+      )}
+
+      {sessionChecked && !isRunning && (
         <section className="welcome-panel">
           <div className="eyebrow">
             <span className="eyebrow-dot" />
@@ -1500,7 +1635,36 @@ export default function Home() {
         </section>
       )}
 
-      {isRunning && (
+      {cameraState === "paused" && (
+        <section className="resume-panel" role="alert">
+          <span className="resume-icon">
+            <RefreshCw size={27} />
+          </span>
+          <div>
+            <strong>Safari พักการทำงานของกล้อง</strong>
+            <p>
+              ระบบจำโหมดเดิมไว้แล้ว แตะหนึ่งครั้งเพื่อทำงานต่อในโหมดประหยัดหน่วยความจำ
+            </p>
+          </div>
+          <button
+            className="resume-button"
+            type="button"
+            onClick={() => void resumeCamera()}
+          >
+            <Camera size={20} />
+            เปิดกล้องต่อ
+          </button>
+          <button
+            className="resume-cancel"
+            type="button"
+            onClick={cancelResume}
+          >
+            กลับหน้าเริ่มต้น
+          </button>
+        </section>
+      )}
+
+      {isRunning && cameraState !== "paused" && (
         <>
           <div
             className={`mode-badge gps-${gpsState}`}
