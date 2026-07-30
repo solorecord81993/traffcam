@@ -1,4 +1,5 @@
 import type { Box } from "@ultralytics/yolo";
+import { formatSpeed, type MotionSnapshot } from "./motion";
 
 export type TravelMode = "walk" | "ride" | "drive";
 export type RiskLevel = "info" | "safe" | "watch" | "danger";
@@ -14,6 +15,11 @@ export type TrackRecord = {
   vx: number;
   vy: number;
   expansionRate: number;
+  distance: number | null;
+  seenCount: number;
+  watchEvidence: number;
+  dangerEvidence: number;
+  stableRisk: RiskLevel;
   updatedAt: number;
   history: Array<{ x: number; y: number }>;
 };
@@ -50,8 +56,8 @@ const MODE_PROFILE = {
   walk: {
     corridorWidth: 0.42,
     cameraHeight: 1.55,
-    warningDistance: 7,
-    dangerDistance: 3,
+    warningDistance: 5.5,
+    dangerDistance: 2.2,
     warningTtc: 3.2,
     dangerTtc: 1.55,
     predictionSeconds: 1,
@@ -59,8 +65,8 @@ const MODE_PROFILE = {
   ride: {
     corridorWidth: 0.35,
     cameraHeight: 1.25,
-    warningDistance: 18,
-    dangerDistance: 7,
+    warningDistance: 14,
+    dangerDistance: 5.5,
     warningTtc: 4,
     dangerTtc: 1.9,
     predictionSeconds: 1.25,
@@ -68,8 +74,8 @@ const MODE_PROFILE = {
   drive: {
     corridorWidth: 0.3,
     cameraHeight: 1.2,
-    warningDistance: 35,
-    dangerDistance: 14,
+    warningDistance: 24,
+    dangerDistance: 9,
     warningTtc: 4.5,
     dangerTtc: 2.15,
     predictionSeconds: 1.5,
@@ -172,11 +178,6 @@ const PHYSICAL_HAZARDS = new Set([
   "suitcase",
   "sports ball",
   "skateboard",
-  "chair",
-  "couch",
-  "potted plant",
-  "bed",
-  "dining table",
 ]);
 
 const INFORMATIONAL_OBJECTS = new Set([
@@ -184,6 +185,25 @@ const INFORMATIONAL_OBJECTS = new Set([
   "stop sign",
   "fire hydrant",
   "parking meter",
+]);
+
+const VEHICLES = new Set([
+  "bicycle",
+  "car",
+  "motorcycle",
+  "bus",
+  "train",
+  "truck",
+]);
+
+const LOW_PRIORITY_HAZARDS = new Set([
+  "bird",
+  "backpack",
+  "umbrella",
+  "handbag",
+  "suitcase",
+  "sports ball",
+  "skateboard",
 ]);
 
 const RISK_COLOR: Record<RiskLevel, string> = {
@@ -209,6 +229,74 @@ function directionFor(cx: number, width: number) {
   if (cx < width * 0.41) return "ซ้าย" as const;
   if (cx > width * 0.59) return "ขวา" as const;
   return "กลาง" as const;
+}
+
+function riskThresholds(
+  mode: TravelMode,
+  motion: MotionSnapshot,
+) {
+  const profile = MODE_PROFILE[mode];
+  if (!motion.reliable) {
+    return {
+      warningDistance: profile.warningDistance,
+      dangerDistance: profile.dangerDistance,
+      moving: true,
+    };
+  }
+
+  const speed = clamp(motion.speedMps, 0, 55);
+  const settings = {
+    walk: {
+      movementFloor: 0.35,
+      reactionSeconds: 0.75,
+      deceleration: 2.3,
+      warningMargin: 2.6,
+      dangerMargin: 1.2,
+      warningMinimum: 4,
+      dangerMinimum: 1.7,
+      warningMaximum: 9,
+      dangerMaximum: 4.5,
+    },
+    ride: {
+      movementFloor: 1.1,
+      reactionSeconds: 1,
+      deceleration: 3.2,
+      warningMargin: 4,
+      dangerMargin: 2.4,
+      warningMinimum: 7,
+      dangerMinimum: 3.2,
+      warningMaximum: 34,
+      dangerMaximum: 17,
+    },
+    drive: {
+      movementFloor: 1.7,
+      reactionSeconds: 1.2,
+      deceleration: 4.5,
+      warningMargin: 5,
+      dangerMargin: 3.2,
+      warningMinimum: 9,
+      dangerMinimum: 4.5,
+      warningMaximum: 65,
+      dangerMaximum: 32,
+    },
+  }[mode];
+  const stoppingDistance =
+    speed * settings.reactionSeconds +
+    (speed * speed) / (2 * settings.deceleration);
+
+  return {
+    warningDistance: clamp(
+      stoppingDistance * 1.08 + settings.warningMargin,
+      settings.warningMinimum,
+      settings.warningMaximum,
+    ),
+    dangerDistance: clamp(
+      stoppingDistance * 0.54 + settings.dangerMargin,
+      settings.dangerMinimum,
+      settings.dangerMaximum,
+    ),
+    moving: speed >= settings.movementFloor,
+  };
 }
 
 export function corridorAt(
@@ -336,6 +424,11 @@ function updateTrack(
       vx: 0,
       vy: 0,
       expansionRate: 0,
+      distance: null,
+      seenCount: 1,
+      watchEvidence: 0,
+      dangerEvidence: 0,
+      stableRisk: "safe",
       updatedAt: now,
       history: [{ x: cx, y: bottom }],
     };
@@ -346,8 +439,11 @@ function updateTrack(
   const dt = clamp((now - previous.updatedAt) / 1000, 0.03, 1.5);
   const rawVx = (cx - previous.cx) / dt;
   const rawVy = (bottom - previous.bottom) / dt;
-  const rawExpansion =
-    (scale - previous.scale) / Math.max(1, previous.scale * dt);
+  const rawExpansion = clamp(
+    (scale - previous.scale) / Math.max(1, previous.scale * dt),
+    -1.2,
+    1.2,
+  );
   const history = [
     ...previous.history.slice(-5),
     { x: cx, y: bottom },
@@ -362,7 +458,8 @@ function updateTrack(
     vx: previous.vx * 0.58 + rawVx * 0.42,
     vy: previous.vy * 0.58 + rawVy * 0.42,
     expansionRate:
-      previous.expansionRate * 0.62 + rawExpansion * 0.38,
+      previous.expansionRate * 0.7 + rawExpansion * 0.3,
+    seenCount: previous.seenCount + 1,
     updatedAt: now,
     history,
   };
@@ -377,8 +474,10 @@ function assessRisk(
   width: number,
   height: number,
   mode: TravelMode,
+  motion: MotionSnapshot,
 ) {
   const profile = MODE_PROFILE[mode];
+  const thresholds = riskThresholds(mode, motion);
   const name = box.name.toLowerCase();
   const boxWidth = Math.max(1, box.x2 - box.x1);
   const cx = (box.x1 + box.x2) / 2;
@@ -413,41 +512,120 @@ function assessRisk(
     predictedX - boxWidth * 0.3 < predictedCorridor.right;
 
   const ttc =
-    track.expansionRate > 0.035
+    track.seenCount >= 3 && track.expansionRate > 0.05
       ? clamp(1 / track.expansionRate, 0.1, 99)
       : 99;
   const isHazard = PHYSICAL_HAZARDS.has(name);
   const isInformational = INFORMATIONAL_OBJECTS.has(name);
+  const priorityScale = LOW_PRIORITY_HAZARDS.has(name) ? 0.58 : 1;
+  const warningDistance = thresholds.warningDistance * priorityScale;
+  const dangerDistance = thresholds.dangerDistance * priorityScale;
   const nearBottom =
     box.y2 >
     height * (mode === "drive" ? 0.79 : mode === "ride" ? 0.82 : 0.86);
-  const closingFast = track.expansionRate > 0.08;
+  const closingFast = track.seenCount >= 3 && track.expansionRate > 0.11;
+  const extremeDanger =
+    nearBottom &&
+    distance <= dangerDistance * 0.58 &&
+    (closingFast || ttc <= 1.05);
   let risk: RiskLevel = isInformational ? "info" : "safe";
 
   if (isHazard && (inPath || (predictedInPath && closingFast))) {
-    if (
-      ttc <= profile.dangerTtc ||
-      (distance <= profile.dangerDistance && (nearBottom || closingFast)) ||
-      (nearBottom && distance <= profile.dangerDistance * 1.35)
-    ) {
-      risk = "danger";
-    } else if (
-      distance <= profile.warningDistance ||
-      ttc <= profile.warningTtc ||
-      predictedInPath
-    ) {
-      risk = "watch";
+    if (motion.reliable && !thresholds.moving) {
+      if (extremeDanger || (closingFast && ttc <= 1.25)) {
+        risk = "danger";
+      }
+    } else {
+      const speedSupportsDistanceWarning =
+        motion.reliable && motion.speedMps >= 4;
+      const distanceWarning =
+        distance <= warningDistance &&
+        (!VEHICLES.has(name) ||
+          nearBottom ||
+          closingFast ||
+          speedSupportsDistanceWarning);
+
+      if (
+        extremeDanger ||
+        ttc <= profile.dangerTtc ||
+        (distance <= dangerDistance &&
+          (nearBottom || closingFast || speedSupportsDistanceWarning))
+      ) {
+        risk = "danger";
+      } else if (
+        distanceWarning ||
+        ttc <= profile.warningTtc ||
+        (predictedInPath && closingFast)
+      ) {
+        risk = "watch";
+      }
     }
   }
 
-  const rank = risk === "danger" ? 3 : risk === "watch" ? 2 : risk === "safe" ? 1 : 0;
+  const rank =
+    risk === "danger" ? 3 : risk === "watch" ? 2 : risk === "safe" ? 1 : 0;
   const severity =
     rank * 100 +
     (inPath ? 24 : predictedInPath ? 12 : 0) +
-    Math.max(0, profile.warningDistance - distance) +
+    Math.max(0, warningDistance - distance) +
     Math.max(0, profile.warningTtc - ttc) * 8;
 
-  return { risk, ttc, inPath, predictedInPath, severity };
+  return {
+    risk,
+    ttc,
+    inPath,
+    predictedInPath,
+    severity,
+    extremeDanger,
+  };
+}
+
+function stabilizeRisk(
+  track: TrackRecord,
+  rawRisk: RiskLevel,
+  extremeDanger: boolean,
+  mode: TravelMode,
+  motion: MotionSnapshot,
+) {
+  if (rawRisk === "info") {
+    const updated = {
+      ...track,
+      watchEvidence: 0,
+      dangerEvidence: 0,
+      stableRisk: "info" as const,
+    };
+    return updated;
+  }
+
+  const warningSignal = rawRisk === "watch" || rawRisk === "danger";
+  const watchEvidence = warningSignal
+    ? Math.min(6, track.watchEvidence + 1)
+    : Math.max(0, track.watchEvidence - 1);
+  const dangerEvidence =
+    rawRisk === "danger"
+      ? Math.min(4, track.dangerEvidence + 1)
+      : Math.max(0, track.dangerEvidence - 1);
+  const fastDrive =
+    mode === "drive" && motion.reliable && motion.speedMps >= 12;
+  const watchHitsRequired = fastDrive ? 2 : 3;
+
+  let stableRisk: RiskLevel = "safe";
+  if (extremeDanger || dangerEvidence >= 2) {
+    stableRisk = "danger";
+  } else if (watchEvidence >= watchHitsRequired) {
+    stableRisk = "watch";
+  } else if (track.stableRisk === "danger" && dangerEvidence > 0) {
+    stableRisk = "danger";
+  } else if (track.stableRisk === "watch" && watchEvidence > 0) {
+    stableRisk = "watch";
+  }
+
+  return {
+    ...track,
+    watchEvidence,
+    dangerEvidence,
+    stableRisk,
+  };
 }
 
 export function analyzeDetections(
@@ -457,18 +635,20 @@ export function analyzeDetections(
   mode: TravelMode,
   now: number,
   store: TrackStore,
+  motion: MotionSnapshot,
 ) {
   const usedTracks = new Set<number>();
   const frameDiagonal = Math.hypot(width, height);
   const detections: AnalyzedDetection[] = [];
 
   for (const box of boxes) {
+    if (detections.length >= 14) break;
     const name = box.name.toLowerCase();
     if (!PHYSICAL_HAZARDS.has(name) && !INFORMATIONAL_OBJECTS.has(name)) {
       continue;
     }
     if (
-      box.conf < 0.28 ||
+      box.conf < 0.35 ||
       box.x2 - box.x1 < width * 0.012 ||
       box.y2 - box.y1 < height * 0.016
     ) {
@@ -484,27 +664,41 @@ export function analyzeDetections(
     );
     const track = updateTrack(box, now, previous, store);
     usedTracks.add(track.id);
-    const distance = estimateDistance(box, width, height, mode);
+    const measuredDistance = estimateDistance(box, width, height, mode);
+    const distance =
+      track.distance === null
+        ? measuredDistance
+        : track.distance * 0.68 + measuredDistance * 0.32;
+    const trackWithDistance = { ...track, distance };
     const assessment = assessRisk(
       box,
-      track,
+      trackWithDistance,
       distance,
       width,
       height,
       mode,
+      motion,
     );
+    const stabilizedTrack = stabilizeRisk(
+      trackWithDistance,
+      assessment.risk,
+      assessment.extremeDanger,
+      mode,
+      motion,
+    );
+    store.tracks.set(stabilizedTrack.id, stabilizedTrack);
     detections.push({
       ...box,
-      id: track.id,
+      id: stabilizedTrack.id,
       thaiName: thaiName(name),
       distance,
       ttc: assessment.ttc,
-      risk: assessment.risk,
+      risk: stabilizedTrack.stableRisk,
       inPath: assessment.inPath,
       predictedInPath: assessment.predictedInPath,
-      direction: directionFor(track.cx, width),
+      direction: directionFor(stabilizedTrack.cx, width),
       severity: assessment.severity,
-      history: track.history,
+      history: stabilizedTrack.history,
     });
   }
 
@@ -518,6 +712,7 @@ export function analyzeDetections(
 export function selectAlert(
   detections: AnalyzedDetection[],
   mode: TravelMode,
+  motion: MotionSnapshot,
 ): VisionAlert | null {
   const candidates = detections
     .filter((detection) => detection.risk === "watch" || detection.risk === "danger")
@@ -536,12 +731,15 @@ export function selectAlert(
       : danger
         ? "ชะลอและเตรียมหยุด"
         : "ลดความเร็วและเพิ่มระยะ";
+  const speedDetail = motion.reliable
+    ? `ความเร็ว ${formatSpeed(motion.speedMps)} กม./ชม. • `
+    : "";
 
   return {
-    key: `${primary.risk}-${primary.id}-${primary.direction}`,
+    key: `${primary.id}-${primary.name}`,
     level: danger ? "danger" : "watch",
     title: danger ? `อันตราย • ${primary.thaiName}${direction}` : `ระวัง • ${primary.thaiName}${direction}`,
-    detail: `${action} • ระยะประมาณ ${formatDistance(primary.distance)}`,
+    detail: `${action} • ${speedDetail}ระยะประมาณ ${formatDistance(primary.distance)}`,
     objectName: primary.thaiName,
     direction,
     distance: primary.distance,

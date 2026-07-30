@@ -10,6 +10,7 @@ import {
   Info,
   LoaderCircle,
   Maximize2,
+  Navigation,
   RefreshCw,
   ShieldCheck,
   Volume2,
@@ -17,6 +18,13 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  deriveMotion,
+  EMPTY_MOTION,
+  formatSpeed,
+  freshMotion,
+  type GeoFix,
+} from "./motion";
 import {
   analyzeDetections,
   formatDistance,
@@ -30,6 +38,18 @@ import {
 
 type CameraState = "idle" | "requesting" | "running" | "error";
 type ModelState = "idle" | "loading" | "ready" | "error";
+type GpsState =
+  | "idle"
+  | "locating"
+  | "ready"
+  | "weak"
+  | "denied"
+  | "unsupported";
+
+const ROAD_CLASS_IDS = [
+  0, 1, 2, 3, 5, 6, 7, 9, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+  24, 25, 26, 28, 32, 36,
+];
 
 const MODES = {
   walk: {
@@ -78,8 +98,10 @@ function concatenateChunks(chunks: Uint8Array[], totalBytes: number) {
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const inferenceCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animationRef = useRef<number | null>(null);
+  const geolocationWatchRef = useRef<number | null>(null);
   const wakeLockRef = useRef<{ release: () => Promise<void> } | null>(null);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const modelRef = useRef<YoloModel | null>(null);
@@ -90,9 +112,16 @@ export default function Home() {
   const soundEnabledRef = useRef(true);
   const inferenceBusyRef = useRef(false);
   const lastInferenceAtRef = useRef(0);
+  const lastOverlayAtRef = useRef(0);
   const inferenceIntervalRef = useRef(260);
   const detectionsRef = useRef<AnalyzedDetection[]>([]);
   const alertRef = useRef<VisionAlert | null>(null);
+  const alertHoldRef = useRef<{
+    alert: VisionAlert | null;
+    lastSeenAt: number;
+  }>({ alert: null, lastSeenAt: 0 });
+  const lastGeoFixRef = useRef<GeoFix | null>(null);
+  const motionRef = useRef({ ...EMPTY_MOTION });
   const trackStoreRef = useRef<TrackStore>({
     nextId: 1,
     tracks: new Map(),
@@ -116,6 +145,8 @@ export default function Home() {
   const [fps, setFps] = useState(0);
   const [detectedCount, setDetectedCount] = useState(0);
   const [alert, setAlert] = useState<VisionAlert | null>(null);
+  const [gpsState, setGpsState] = useState<GpsState>("idle");
+  const [speedKmh, setSpeedKmh] = useState(0);
 
   const currentMode = MODES[mode];
   const isRunning = cameraState === "running";
@@ -131,6 +162,7 @@ export default function Home() {
     trackStoreRef.current = { nextId: 1, tracks: new Map() };
     detectionsRef.current = [];
     alertRef.current = null;
+    alertHoldRef.current = { alert: null, lastSeenAt: 0 };
     setAlert(null);
     setDetectedCount(0);
     setControlsVisible(true);
@@ -175,7 +207,7 @@ export default function Home() {
       if (!soundEnabledRef.current) return;
       const now = Date.now();
       const previous = lastAudioAlertRef.current;
-      const cooldown = nextAlert.level === "danger" ? 2800 : 5200;
+      const cooldown = nextAlert.level === "danger" ? 6500 : 14000;
       const escalated =
         nextAlert.level === "danger" && previous.level !== "danger";
       if (
@@ -185,7 +217,7 @@ export default function Home() {
       ) {
         return;
       }
-      if (!escalated && now - previous.at < 1900) return;
+      if (!escalated && now - previous.at < 4200) return;
       lastAudioAlertRef.current = {
         key: nextAlert.key,
         level: nextAlert.level,
@@ -325,6 +357,77 @@ export default function Home() {
     }
   }, []);
 
+  const stopLocationTracking = useCallback(() => {
+    if (
+      geolocationWatchRef.current !== null &&
+      "geolocation" in navigator
+    ) {
+      navigator.geolocation.clearWatch(geolocationWatchRef.current);
+    }
+    geolocationWatchRef.current = null;
+    lastGeoFixRef.current = null;
+    motionRef.current = { ...EMPTY_MOTION };
+    setSpeedKmh(0);
+    setGpsState("idle");
+  }, []);
+
+  const startLocationTracking = useCallback(() => {
+    if (!("geolocation" in navigator)) {
+      setGpsState("unsupported");
+      motionRef.current = { ...EMPTY_MOTION };
+      return;
+    }
+
+    if (geolocationWatchRef.current !== null) {
+      navigator.geolocation.clearWatch(geolocationWatchRef.current);
+    }
+
+    setGpsState("locating");
+    geolocationWatchRef.current = navigator.geolocation.watchPosition(
+      (position) => {
+        const fix: GeoFix = {
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+          accuracy: position.coords.accuracy,
+          speedMps:
+            position.coords.speed !== null &&
+            Number.isFinite(position.coords.speed)
+              ? position.coords.speed
+              : null,
+          timestamp: Number.isFinite(position.timestamp)
+            ? position.timestamp
+            : Date.now(),
+        };
+        const motion = deriveMotion(
+          lastGeoFixRef.current,
+          fix,
+          motionRef.current,
+        );
+        lastGeoFixRef.current = fix;
+        motionRef.current = motion;
+        setSpeedKmh(formatSpeed(motion.speedMps));
+        setGpsState(motion.reliable ? "ready" : "weak");
+      },
+      (error) => {
+        motionRef.current = {
+          ...motionRef.current,
+          reliable: false,
+        };
+        if (error.code === error.PERMISSION_DENIED) {
+          setGpsState("denied");
+          setSpeedKmh(0);
+        } else {
+          setGpsState("weak");
+        }
+      },
+      {
+        enableHighAccuracy: true,
+        maximumAge: 1000,
+        timeout: 12000,
+      },
+    );
+  }, []);
+
   const stopCamera = useCallback(() => {
     runningRef.current = false;
     cameraSessionRef.current += 1;
@@ -332,15 +435,17 @@ export default function Home() {
     animationRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+    stopLocationTracking();
     void wakeLockRef.current?.release();
     wakeLockRef.current = null;
     detectionsRef.current = [];
     alertRef.current = null;
+    alertHoldRef.current = { alert: null, lastSeenAt: 0 };
     trackStoreRef.current = { nextId: 1, tracks: new Map() };
     setAlert(null);
     setDetectedCount(0);
     setFps(0);
-  }, []);
+  }, [stopLocationTracking]);
 
   const runInference = useCallback(
     async (session: number) => {
@@ -359,9 +464,44 @@ export default function Home() {
       inferenceBusyRef.current = true;
       const startedAt = performance.now();
       try {
-        const results = await model.predict(video, {
-          conf: 0.28,
-          iou: 0.58,
+        const inferenceCanvas =
+          inferenceCanvasRef.current ?? document.createElement("canvas");
+        inferenceCanvasRef.current = inferenceCanvas;
+        const sourceScale = Math.min(
+          1,
+          640 / Math.max(video.videoWidth, video.videoHeight),
+        );
+        const sourceWidth = Math.max(
+          1,
+          Math.round(video.videoWidth * sourceScale),
+        );
+        const sourceHeight = Math.max(
+          1,
+          Math.round(video.videoHeight * sourceScale),
+        );
+        if (
+          inferenceCanvas.width !== sourceWidth ||
+          inferenceCanvas.height !== sourceHeight
+        ) {
+          inferenceCanvas.width = sourceWidth;
+          inferenceCanvas.height = sourceHeight;
+        }
+        const inferenceContext = inferenceCanvas.getContext("2d", {
+          alpha: false,
+        });
+        if (!inferenceContext) return;
+        inferenceContext.drawImage(
+          video,
+          0,
+          0,
+          sourceWidth,
+          sourceHeight,
+        );
+
+        const results = await model.predict(inferenceCanvas, {
+          conf: 0.36,
+          iou: 0.52,
+          classes: ROAD_CLASS_IDS,
         });
         if (
           session !== cameraSessionRef.current ||
@@ -370,33 +510,75 @@ export default function Home() {
           return;
         }
 
+        const resultWidth = results.width || sourceWidth;
+        const resultHeight = results.height || sourceHeight;
+        const scaleX = video.videoWidth / resultWidth;
+        const scaleY = video.videoHeight / resultHeight;
+        const displayBoxes = results.boxes.map((box) => ({
+          ...box,
+          x1: box.x1 * scaleX,
+          x2: box.x2 * scaleX,
+          y1: box.y1 * scaleY,
+          y2: box.y2 * scaleY,
+        }));
+        const motion = freshMotion(motionRef.current);
+        if (!motion.reliable && motionRef.current.reliable) {
+          motionRef.current = motion;
+          setGpsState("weak");
+        }
+        const now = performance.now();
         const analyzed = analyzeDetections(
-          results.boxes,
-          results.width || video.videoWidth,
-          results.height || video.videoHeight,
+          displayBoxes,
+          video.videoWidth,
+          video.videoHeight,
           modeRef.current,
-          performance.now(),
+          now,
           trackStoreRef.current,
+          motion,
         );
-        const nextAlert = selectAlert(analyzed, modeRef.current);
+        const nextAlert = selectAlert(analyzed, modeRef.current, motion);
+        let visibleAlert = nextAlert;
+        if (nextAlert) {
+          alertHoldRef.current = { alert: nextAlert, lastSeenAt: now };
+        } else if (
+          alertHoldRef.current.alert &&
+          now - alertHoldRef.current.lastSeenAt < 1400
+        ) {
+          visibleAlert = alertHoldRef.current.alert;
+        } else {
+          alertHoldRef.current = { alert: null, lastSeenAt: 0 };
+        }
         detectionsRef.current = analyzed;
-        alertRef.current = nextAlert;
+        alertRef.current = visibleAlert;
         setDetectedCount(analyzed.length);
         setAlert((previous) => {
           if (
-            previous?.key === nextAlert?.key &&
-            previous?.detail === nextAlert?.detail
+            previous?.key === visibleAlert?.key &&
+            previous?.level === visibleAlert?.level &&
+            previous?.detail === visibleAlert?.detail
           ) {
             return previous;
           }
-          return nextAlert;
+          return visibleAlert;
         });
         if (nextAlert) playWarning(nextAlert);
 
         const elapsed = performance.now() - startedAt;
+        const moving = !motion.reliable || motion.speedMps >= 1.2;
+        const intervalFloor =
+          model.device === "webgpu"
+            ? moving
+              ? 110
+              : 260
+            : moving
+              ? 240
+              : 560;
         inferenceIntervalRef.current = Math.min(
-          950,
-          Math.max(model.device === "webgpu" ? 115 : 280, elapsed * 0.72),
+          moving ? 900 : 1200,
+          Math.max(
+            intervalFloor,
+            elapsed * (model.device === "webgpu" ? 0.25 : 0.34),
+          ),
         );
 
         const stats = statsRef.current;
@@ -428,20 +610,23 @@ export default function Home() {
         const video = videoRef.current;
         const canvas = canvasRef.current;
         if (video && canvas && video.videoWidth && video.videoHeight) {
-          if (
-            canvas.width !== video.videoWidth ||
-            canvas.height !== video.videoHeight
-          ) {
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
+          if (elapsed - lastOverlayAtRef.current >= 33) {
+            lastOverlayAtRef.current = elapsed;
+            if (
+              canvas.width !== video.videoWidth ||
+              canvas.height !== video.videoHeight
+            ) {
+              canvas.width = video.videoWidth;
+              canvas.height = video.videoHeight;
+            }
+            renderVisionOverlay(
+              canvas,
+              modeRef.current,
+              elapsed,
+              detectionsRef.current,
+              alertRef.current,
+            );
           }
-          renderVisionOverlay(
-            canvas,
-            modeRef.current,
-            elapsed,
-            detectionsRef.current,
-            alertRef.current,
-          );
           if (
             modelRef.current &&
             elapsed - lastInferenceAtRef.current >=
@@ -485,6 +670,8 @@ export default function Home() {
       await unlockAudio();
       stopCamera();
       const session = ++cameraSessionRef.current;
+      lastInferenceAtRef.current = 0;
+      lastOverlayAtRef.current = 0;
       setCameraState("requesting");
       setErrorMessage("");
       void loadYolo().catch(() => undefined);
@@ -494,15 +681,15 @@ export default function Home() {
           video: deviceId
             ? {
                 deviceId: { exact: deviceId },
-                width: { ideal: 1280 },
-                height: { ideal: 720 },
-                frameRate: { ideal: 30, max: 30 },
+                width: { ideal: 960, max: 1280 },
+                height: { ideal: 540, max: 720 },
+                frameRate: { ideal: 24, max: 30 },
               }
             : {
                 facingMode: { ideal: "environment" },
-                width: { ideal: 1280 },
-                height: { ideal: 720 },
-                frameRate: { ideal: 30, max: 30 },
+                width: { ideal: 960, max: 1280 },
+                height: { ideal: 540, max: 720 },
+                frameRate: { ideal: 24, max: 30 },
               },
         });
         if (session !== cameraSessionRef.current) {
@@ -514,6 +701,7 @@ export default function Home() {
         if (!video) throw new Error("camera-view-missing");
         video.srcObject = stream;
         await video.play();
+        startLocationTracking();
         await refreshCameraList();
         await requestWakeLock();
         runningRef.current = true;
@@ -526,6 +714,7 @@ export default function Home() {
         beginVisionLoop(session);
       } catch (error) {
         console.error(error);
+        stopLocationTracking();
         setErrorMessage(
           "เปิดกล้องไม่ได้ กรุณาอนุญาต Camera ใน Safari แล้วลองอีกครั้ง",
         );
@@ -537,7 +726,9 @@ export default function Home() {
       loadYolo,
       refreshCameraList,
       requestWakeLock,
+      startLocationTracking,
       stopCamera,
+      stopLocationTracking,
       unlockAudio,
     ],
   );
@@ -613,6 +804,16 @@ export default function Home() {
         : modelState === "error"
           ? "AI ไม่พร้อม"
           : "เตรียม AI";
+  const gpsLabel =
+    gpsState === "ready"
+      ? `${speedKmh} กม./ชม.`
+      : gpsState === "locating"
+        ? "กำลังหา GPS"
+        : gpsState === "denied"
+          ? "GPS ถูกปิด"
+          : gpsState === "unsupported"
+            ? "ไม่รองรับ GPS"
+            : "สัญญาณ GPS อ่อน";
 
   return (
     <main
@@ -718,11 +919,11 @@ export default function Home() {
               ? "กำลังขอสิทธิ์กล้อง…"
               : cameraState === "error"
                 ? "ลองเปิดกล้องอีกครั้ง"
-                : "เริ่มกล้องและ AI"}
+                : "เริ่มกล้อง GPS และ AI"}
           </button>
 
           <p className="download-note">
-            ครั้งแรกจะดาวน์โหลดโมเดล AI และเก็บไว้ในเครื่อง • แนะนำ Wi‑Fi
+            ระบบจะขอสิทธิ์กล้องและตำแหน่ง • ครั้งแรกแนะนำ Wi‑Fi
           </p>
 
           {errorMessage && (
@@ -744,13 +945,16 @@ export default function Home() {
 
       {isRunning && (
         <>
-          <div className="mode-badge">
+          <div
+            className={`mode-badge gps-${gpsState}`}
+            role="status"
+            aria-label={`${currentMode.label} ${gpsLabel} พบ ${detectedCount} วัตถุ`}
+          >
             <ModeIcon mode={mode} size={18} />
-            {currentMode.label}
-            <span>•</span>
-            {modelState === "ready"
-              ? `พบ ${detectedCount} วัตถุ`
-              : "กำลังเตรียมการตรวจจับ"}
+            <strong>{currentMode.label}</strong>
+            <span className="badge-divider" />
+            <Navigation className="gps-icon" size={15} />
+            <span className="speed-reading">{gpsLabel}</span>
           </div>
 
           {modelState === "loading" && (
@@ -803,7 +1007,9 @@ export default function Home() {
             </div>
           )}
 
-          <div className="estimate-note">ระยะและเวลาปะทะเป็นค่าประมาณ</div>
+          <div className="estimate-note">
+            GPS ระยะ และเวลาปะทะเป็นค่าประมาณ
+          </div>
 
           <div className="bottom-controls">
             <div className="quick-modes" aria-label="เปลี่ยนโหมดเดินทาง">
@@ -886,13 +1092,14 @@ export default function Home() {
             <ul>
               <li>ยึด iPhone ให้มั่นคงและไม่บังทัศนวิสัย</li>
               <li>อย่าถือหรือแตะหน้าจอขณะขี่หรือขับรถ</li>
-              <li>ระยะบนจอเป็นเพียงค่าประมาณจากกล้องเดียว</li>
+              <li>อนุญาตตำแหน่งเพื่อใช้ความเร็ว GPS ปรับระยะเตือน</li>
+              <li>GPS และระยะบนจอเป็นค่าประมาณ อาจคลาดเคลื่อนหรือขาดหาย</li>
               <li>YOLO มองวัตถุ แต่แนวทางสีเขียวเป็นทางคาดการณ์จากจุดกึ่งกลางกล้อง</li>
               <li>บน iPhone ใช้ แชร์ → เพิ่มไปยังหน้าจอโฮม เพื่อเปิดแบบเต็มจอ</li>
             </ul>
             <div className="privacy-box">
               <ShieldCheck size={17} />
-              ภาพจากกล้องประมวลผลบนอุปกรณ์และไม่ถูกอัปโหลด
+              ภาพและข้อมูลตำแหน่งประมวลผลบนอุปกรณ์และไม่ถูกอัปโหลด
             </div>
             <button
               className="sheet-confirm"
