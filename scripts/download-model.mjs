@@ -43,10 +43,15 @@ async function isValidModel(filePath) {
 
 async function copyOrtRuntime() {
   await mkdir(ortDirectory, { recursive: true });
-  await copyFile(
-    path.join(ortSourceDirectory, "ort-wasm-simd-threaded.wasm"),
-    path.join(ortDirectory, "ort-wasm-simd-threaded.wasm"),
-  );
+  for (const filename of [
+    "ort-wasm-simd-threaded.mjs",
+    "ort-wasm-simd-threaded.wasm",
+  ]) {
+    await copyFile(
+      path.join(ortSourceDirectory, filename),
+      path.join(ortDirectory, filename),
+    );
+  }
 }
 
 await copyOrtRuntime();

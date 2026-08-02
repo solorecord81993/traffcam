@@ -15,6 +15,7 @@
 # generated model (downloaded and verified during build)
 /public/models/*.onnx
 /public/models/*.download
+/public/ort/*.mjs
 /public/ort/*.wasm
 
 # tooling

@@ -50,7 +50,14 @@ function canTryWebGpu() {
 }
 
 async function createSession(modelUrl: string) {
-  ort.env.wasm.wasmPaths = "/ort/";
+  // Keep the Emscripten JS and WASM files on the same-origin public path.
+  // ORT's WebGPU bundle otherwise tries to dynamically import its asyncify
+  // runtime next to the hashed worker chunk, which is not a public asset on
+  // Vercel and leaves the WASM fallback with no available backend.
+  ort.env.wasm.wasmPaths = {
+    mjs: "/ort/ort-wasm-simd-threaded.mjs",
+    wasm: "/ort/ort-wasm-simd-threaded.wasm",
+  };
   ort.env.wasm.simd = true;
   ort.env.wasm.numThreads =
     typeof crossOriginIsolated !== "undefined" && crossOriginIsolated
