@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 
 const MODEL_URL =
@@ -10,6 +18,13 @@ const EXPECTED_SHA256 =
 const modelDirectory = path.join(process.cwd(), "public", "models");
 const modelPath = path.join(modelDirectory, "yolo26n.onnx");
 const temporaryPath = `${modelPath}.download`;
+const ortDirectory = path.join(process.cwd(), "public", "ort");
+const ortSourceDirectory = path.join(
+  process.cwd(),
+  "node_modules",
+  "onnxruntime-web",
+  "dist",
+);
 
 function digest(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -25,6 +40,16 @@ async function isValidModel(filePath) {
     return false;
   }
 }
+
+async function copyOrtRuntime() {
+  await mkdir(ortDirectory, { recursive: true });
+  await copyFile(
+    path.join(ortSourceDirectory, "ort-wasm-simd-threaded.wasm"),
+    path.join(ortDirectory, "ort-wasm-simd-threaded.wasm"),
+  );
+}
+
+await copyOrtRuntime();
 
 if (await isValidModel(modelPath)) {
   console.log("YOLO26 model is ready.");

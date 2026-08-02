@@ -1,4 +1,3 @@
-import type { Box } from "@ultralytics/yolo";
 import { formatSpeed, type MotionSnapshot } from "./motion";
 import {
   dashboardTopAt,
@@ -12,9 +11,20 @@ import {
 export type TravelMode = "walk" | "ride" | "drive";
 export type RiskLevel = "info" | "safe" | "watch" | "danger";
 
+export type Box = {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  conf: number;
+  cls?: number;
+  name: string;
+};
+
 export type TrackRecord = {
   id: number;
   name: string;
+  cls?: number;
   cx: number;
   cy: number;
   bottom: number;
@@ -160,60 +170,6 @@ const PHYSICAL_HEIGHT: Record<string, number> = {
   "dining table": 0.75,
 };
 
-const PHYSICAL_HAZARDS = new Set([
-  "person",
-  "bicycle",
-  "car",
-  "motorcycle",
-  "bus",
-  "train",
-  "truck",
-  "boat",
-  "bench",
-  "bird",
-  "cat",
-  "dog",
-  "horse",
-  "sheep",
-  "cow",
-  "elephant",
-  "bear",
-  "zebra",
-  "giraffe",
-  "backpack",
-  "umbrella",
-  "handbag",
-  "suitcase",
-  "sports ball",
-  "skateboard",
-]);
-
-const INFORMATIONAL_OBJECTS = new Set([
-  "traffic light",
-  "stop sign",
-  "fire hydrant",
-  "parking meter",
-]);
-
-const VEHICLES = new Set([
-  "bicycle",
-  "car",
-  "motorcycle",
-  "bus",
-  "train",
-  "truck",
-]);
-
-const LOW_PRIORITY_HAZARDS = new Set([
-  "bird",
-  "backpack",
-  "umbrella",
-  "handbag",
-  "suitcase",
-  "sports ball",
-  "skateboard",
-]);
-
 const RISK_COLOR: Record<RiskLevel, string> = {
   info: "#72e6ff",
   safe: "#ffe071",
@@ -226,7 +182,8 @@ function clamp(value: number, minimum: number, maximum: number) {
 }
 
 function thaiName(name: string) {
-  return THAI_NAMES[name.toLowerCase()] ?? name;
+  if (name.toLowerCase() === "obstacle") return "สิ่งกีดขวาง";
+  return THAI_NAMES[name.toLowerCase()] ?? "สิ่งกีดขวาง";
 }
 
 function classHeight(name: string) {
@@ -431,6 +388,7 @@ function matchTrack(
     if (
       usedTracks.has(track.id) ||
       track.name !== box.name ||
+      track.cls !== box.cls ||
       now - track.updatedAt > 1500
     ) {
       continue;
@@ -463,6 +421,7 @@ function updateTrack(
     const created: TrackRecord = {
       id: store.nextId++,
       name: box.name,
+      cls: box.cls,
       cx,
       cy,
       bottom,
@@ -526,7 +485,6 @@ function assessRisk(
 ) {
   const profile = MODE_PROFILE[mode];
   const thresholds = riskThresholds(mode, motion);
-  const name = box.name.toLowerCase();
   const boxWidth = Math.max(1, box.x2 - box.x1);
   const cx = (box.x1 + box.x2) / 2;
   const currentCorridor = corridorAt(
@@ -570,9 +528,11 @@ function assessRisk(
     track.seenCount >= 3 && track.expansionRate > 0.05
       ? clamp(1 / track.expansionRate, 0.1, 99)
       : 99;
-  const isHazard = PHYSICAL_HAZARDS.has(name);
-  const isInformational = INFORMATIONAL_OBJECTS.has(name);
-  const priorityScale = LOW_PRIORITY_HAZARDS.has(name) ? 0.58 : 1;
+  // The fast obstacle model intentionally does not identify object classes.
+  // Every sufficiently confident box is treated as a possible obstacle.
+  const isHazard = true;
+  const isInformational = false;
+  const priorityScale = 1;
   const warningDistance = thresholds.warningDistance * priorityScale;
   const dangerDistance = thresholds.dangerDistance * priorityScale;
   const nearBottom =
@@ -595,10 +555,7 @@ function assessRisk(
         motion.reliable && motion.speedMps >= 4;
       const distanceWarning =
         distance <= warningDistance &&
-        (!VEHICLES.has(name) ||
-          nearBottom ||
-          closingFast ||
-          speedSupportsDistanceWarning);
+        (nearBottom || closingFast || speedSupportsDistanceWarning);
 
       if (
         extremeDanger ||
@@ -700,9 +657,6 @@ export function analyzeDetections(
   for (const box of boxes) {
     if (detections.length >= 10) break;
     const name = box.name.toLowerCase();
-    if (!PHYSICAL_HAZARDS.has(name) && !INFORMATIONAL_OBJECTS.has(name)) {
-      continue;
-    }
     if (isDashboardDetection(box, width, height, mode, roadScene)) {
       continue;
     }

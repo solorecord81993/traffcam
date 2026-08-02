@@ -14,9 +14,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@ultralytics/yolo": "0.0.30",
     "lucide-react": "1.27.0",
     "next": "16.2.6",
+    "onnxruntime-web": "1.27.0",
     "react": "19.2.6",
     "react-dom": "19.2.6"
   },

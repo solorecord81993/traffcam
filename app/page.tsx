@@ -1,6 +1,5 @@
 "use client";
 
-import type { YOLO as YoloModel } from "@ultralytics/yolo";
 import {
   AlertTriangle,
   Bike,
@@ -61,7 +60,6 @@ type GpsState =
 type RuntimeProfile = {
   ios: boolean;
   recovery: boolean;
-  modelDevice: "auto" | "cpu";
   cameraMaxWidth: number;
   cameraMaxFps: number;
   inputMax: number;
@@ -91,29 +89,45 @@ type StopCameraOptions = {
   resetUi?: boolean;
 };
 
+type WorkerBox = {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  conf: number;
+  cls: number;
+  name: "obstacle";
+};
+
+type WorkerResult = {
+  type: "result";
+  requestId: number;
+  boxes: WorkerBox[];
+  inferenceMs: number;
+};
+
+type WorkerResolver = {
+  resolve: (result: WorkerResult) => void;
+  reject: (error: Error) => void;
+};
+
 const VISION_SESSION_KEY = "roadguard-vision-session-v3";
 const VISION_SESSION_MAX_AGE = 4 * 60 * 60 * 1000;
 const CAMERA_REQUEST_TIMEOUT = 15000;
 const DEFAULT_RUNTIME_PROFILE: RuntimeProfile = {
   ios: false,
   recovery: false,
-  modelDevice: "auto",
   cameraMaxWidth: 1280,
-  cameraMaxFps: 24,
-  inputMax: 512,
+  cameraMaxFps: 30,
+  inputMax: 360,
   overlayMax: 1920,
   roadMax: 272,
   roadIntervalMoving: 420,
   roadIntervalStopped: 700,
-  overlayInterval: 50,
-  inferenceMovingCooldown: 120,
-  inferenceStoppedCooldown: 360,
+  overlayInterval: 33,
+  inferenceMovingCooldown: 80,
+  inferenceStoppedCooldown: 180,
 };
-
-const ROAD_CLASS_IDS = [
-  0, 1, 2, 3, 5, 6, 7, 9, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-  24, 25, 26, 28, 32, 36,
-];
 
 const MODES = {
   walk: {
@@ -303,33 +317,31 @@ function selectRuntimeProfile(recovery: boolean): RuntimeProfile {
     return {
       ios: true,
       recovery: true,
-      modelDevice: "cpu",
       cameraMaxWidth: 720,
-      cameraMaxFps: 20,
-      inputMax: 256,
+      cameraMaxFps: 24,
+      inputMax: 288,
       overlayMax: 960,
       roadMax: 208,
       roadIntervalMoving: 140,
       roadIntervalStopped: 240,
-      overlayInterval: 50,
-      inferenceMovingCooldown: 1200,
-      inferenceStoppedCooldown: 1700,
+      overlayInterval: 33,
+      inferenceMovingCooldown: 180,
+      inferenceStoppedCooldown: 300,
     };
   }
   return {
     ios: true,
     recovery: false,
-    modelDevice: "cpu",
-    cameraMaxWidth: 960,
-    cameraMaxFps: 24,
-    inputMax: 320,
+    cameraMaxWidth: 1280,
+    cameraMaxFps: 30,
+    inputMax: 360,
     overlayMax: 1280,
     roadMax: 256,
     roadIntervalMoving: 100,
     roadIntervalStopped: 180,
     overlayInterval: 33,
-    inferenceMovingCooldown: 760,
-    inferenceStoppedCooldown: 1100,
+    inferenceMovingCooldown: 80,
+    inferenceStoppedCooldown: 180,
   };
 }
 
@@ -449,8 +461,11 @@ export default function Home() {
   const backgroundReleaseTimerRef = useRef<ReturnType<
     typeof setTimeout
   > | null>(null);
-  const modelRef = useRef<YoloModel | null>(null);
-  const modelPromiseRef = useRef<Promise<void> | null>(null);
+  const obstacleWorkerRef = useRef<Worker | null>(null);
+  const obstacleWorkerPromiseRef = useRef<Promise<void> | null>(null);
+  const obstacleModelReadyRef = useRef(false);
+  const obstacleRequestIdRef = useRef(0);
+  const obstacleResolversRef = useRef(new Map<number, WorkerResolver>());
   const runningRef = useRef(false);
   const activeDeviceIdRef = useRef<string | undefined>(undefined);
   const resumeInFlightRef = useRef(false);
@@ -656,64 +671,108 @@ export default function Home() {
     [],
   );
 
-  const loadYolo = useCallback(async () => {
-    if (modelRef.current) return;
-    if (modelPromiseRef.current) return modelPromiseRef.current;
+  const loadObstacleModel = useCallback(async () => {
+    if (obstacleWorkerRef.current) return;
+    if (obstacleWorkerPromiseRef.current) {
+      return obstacleWorkerPromiseRef.current;
+    }
 
-    const task = (async () => {
+    const task = new Promise<void>((resolve, reject) => {
+      obstacleModelReadyRef.current = false;
       setModelState("loading");
-      setModelProgress(3);
+      setModelProgress(12);
       setModelError("");
-      try {
-        const response = await fetch("/models/yolo26n.onnx", {
-          cache: "force-cache",
-        });
-        if (!response.ok) {
-          throw new Error(`ดาวน์โหลดโมเดลไม่สำเร็จ (${response.status})`);
+      const worker = new Worker(
+        new URL("./obstacle-worker.ts", import.meta.url),
+        { type: "module" },
+      );
+      obstacleWorkerRef.current = worker;
+      worker.onmessage = (event: MessageEvent) => {
+        const message = event.data as
+          | { type: "ready"; backend: string }
+          | WorkerResult
+          | {
+              type: "error";
+              stage: "load" | "infer";
+              requestId?: number;
+              message: string;
+            };
+        if (message.type === "ready") {
+          obstacleModelReadyRef.current = true;
+          setModelBackend(message.backend);
+          setModelProgress(100);
+          setModelState("ready");
+          resolve();
+          return;
         }
-
-        setModelProgress(24);
-        const modelBytes = new Uint8Array(await response.arrayBuffer());
-        if (!modelBytes.byteLength) throw new Error("ไฟล์โมเดลว่างเปล่า");
-        setModelProgress(82);
-        const { YOLO } = await import("@ultralytics/yolo");
-        setModelProgress(91);
-        const model = await YOLO.load(modelBytes, {
-          device: runtimeProfileRef.current.modelDevice,
-        });
-        modelRef.current = model;
-        setModelBackend(model.device);
-        setModelProgress(100);
-        setModelState("ready");
-      } catch (error) {
-        console.error(error);
-        const message =
-          error instanceof Error
-            ? error.message
-            : "ไม่สามารถเริ่มโมเดล YOLO ได้";
-        setModelError(message);
+        if (message.type === "result") {
+          const resolver = obstacleResolversRef.current.get(
+            message.requestId,
+          );
+          if (!resolver) return;
+          obstacleResolversRef.current.delete(message.requestId);
+          resolver.resolve(message);
+          return;
+        }
+        const error = new Error(message.message);
+        if (message.requestId !== undefined) {
+          const resolver = obstacleResolversRef.current.get(
+            message.requestId,
+          );
+          if (resolver) {
+            obstacleResolversRef.current.delete(message.requestId);
+            resolver.reject(error);
+          }
+        }
+        if (message.stage === "load") {
+          worker.terminate();
+          obstacleWorkerRef.current = null;
+          obstacleWorkerPromiseRef.current = null;
+          obstacleModelReadyRef.current = false;
+          setModelError(message.message);
+          setModelState("error");
+          reject(error);
+        }
+      };
+      worker.onerror = (event) => {
+        const error = new Error(event.message || "AI worker หยุดทำงาน");
+        for (const resolver of obstacleResolversRef.current.values()) {
+          resolver.reject(error);
+        }
+        obstacleResolversRef.current.clear();
+        worker.terminate();
+        obstacleWorkerRef.current = null;
+        obstacleWorkerPromiseRef.current = null;
+        obstacleModelReadyRef.current = false;
+        setModelError(error.message);
         setModelState("error");
-        modelPromiseRef.current = null;
-        throw error;
-      }
-    })();
-    modelPromiseRef.current = task;
+        reject(error);
+      };
+      setModelProgress(28);
+      worker.postMessage({
+        type: "init",
+        modelUrl: "/models/yolo26n.onnx",
+      });
+    });
+    obstacleWorkerPromiseRef.current = task;
     return task;
   }, []);
 
-  const releaseYoloForBackground = useCallback(() => {
-    const model = modelRef.current;
-    if (!model || inferenceBusyRef.current) return false;
-    model.free();
-    modelRef.current = null;
-    modelPromiseRef.current = null;
+  const releaseObstacleModelForBackground = useCallback(() => {
+    const worker = obstacleWorkerRef.current;
+    if (!worker || inferenceBusyRef.current) return false;
+    worker.postMessage({ type: "dispose" });
+    worker.terminate();
+    obstacleWorkerRef.current = null;
+    obstacleWorkerPromiseRef.current = null;
+    obstacleModelReadyRef.current = false;
     setModelBackend("");
     setModelProgress(0);
     setModelState("idle");
     return true;
   }, []);
 
-  const scheduleYoloRelease = useCallback(() => {
+  const scheduleObstacleModelRelease = useCallback(() => {
     if (!isIOSDevice()) return;
     if (backgroundReleaseTimerRef.current) {
       clearTimeout(backgroundReleaseTimerRef.current);
@@ -722,7 +781,7 @@ export default function Home() {
     let attempts = 0;
     const releaseWhenIdle = () => {
       backgroundReleaseTimerRef.current = null;
-      if (!document.hidden || releaseYoloForBackground()) return;
+      if (!document.hidden || releaseObstacleModelForBackground()) return;
       attempts += 1;
       if (attempts >= 8) return;
       backgroundReleaseTimerRef.current = setTimeout(
@@ -731,7 +790,7 @@ export default function Home() {
       );
     };
     releaseWhenIdle();
-  }, [releaseYoloForBackground]);
+  }, [releaseObstacleModelForBackground]);
 
   const requestWakeLock = useCallback(async () => {
     try {
@@ -935,9 +994,10 @@ export default function Home() {
 
   const runInference = useCallback(
     async (session: number, frame: ImageData) => {
-      const model = modelRef.current;
+      const worker = obstacleWorkerRef.current;
       if (
-        !model ||
+        !worker ||
+        !obstacleModelReadyRef.current ||
         inferenceBusyRef.current ||
         document.hidden
       ) {
@@ -946,11 +1006,20 @@ export default function Home() {
 
       inferenceBusyRef.current = true;
       const startedAt = performance.now();
+      const requestId = ++obstacleRequestIdRef.current;
       try {
-        const results = await model.predict(frame, {
-          conf: 0.36,
-          iou: 0.52,
-          classes: ROAD_CLASS_IDS,
+        const results = await new Promise<WorkerResult>((resolve, reject) => {
+          obstacleResolversRef.current.set(requestId, { resolve, reject });
+          worker.postMessage(
+            {
+              type: "infer",
+              requestId,
+              width: frame.width,
+              height: frame.height,
+              pixels: frame.data.buffer,
+            },
+            [frame.data.buffer as ArrayBuffer],
+          );
         });
         if (
           session !== cameraSessionRef.current ||
@@ -959,17 +1028,6 @@ export default function Home() {
           return;
         }
 
-        const resultWidth = results.width || frame.width;
-        const resultHeight = results.height || frame.height;
-        const scaleX = frame.width / resultWidth;
-        const scaleY = frame.height / resultHeight;
-        const displayBoxes = results.boxes.map((box) => ({
-          ...box,
-          x1: box.x1 * scaleX,
-          x2: box.x2 * scaleX,
-          y1: box.y1 * scaleY,
-          y2: box.y2 * scaleY,
-        }));
         const motion = freshMotion(motionRef.current);
         if (!motion.reliable && motionRef.current.reliable) {
           motionRef.current = motion;
@@ -977,7 +1035,7 @@ export default function Home() {
         }
         const now = performance.now();
         const analyzed = analyzeDetections(
-          displayBoxes,
+          results.boxes,
           frame.width,
           frame.height,
           modeRef.current,
@@ -1017,12 +1075,9 @@ export default function Home() {
         const elapsed = performance.now() - startedAt;
         const moving = !motion.reliable || motion.speedMps >= 1.2;
         const profile = runtimeProfileRef.current;
-        let cooldown = moving
+        const cooldown = moving
           ? profile.inferenceMovingCooldown
           : profile.inferenceStoppedCooldown;
-        if (!profile.ios && model.device !== "webgpu") {
-          cooldown = Math.max(cooldown, moving ? 340 : 620);
-        }
         // lastInferenceAtRef records the start time, so include inference time
         // to guarantee a real cooldown instead of immediately starting again.
         inferenceIntervalRef.current = elapsed + cooldown;
@@ -1036,15 +1091,16 @@ export default function Home() {
           statsRef.current = { startedAt: performance.now(), frames: 0 };
         }
       } catch (error) {
-        console.error("YOLO inference failed", error);
+        console.error("Obstacle inference failed", error);
         inferenceErrorCountRef.current += 1;
         if (
           inferenceErrorCountRef.current >= 3 &&
-          modelRef.current === model
+          obstacleWorkerRef.current === worker
         ) {
-          model.free();
-          modelRef.current = null;
-          modelPromiseRef.current = null;
+          worker.terminate();
+          obstacleWorkerRef.current = null;
+          obstacleWorkerPromiseRef.current = null;
+          obstacleModelReadyRef.current = false;
           detectionsRef.current = [];
           alertRef.current = null;
           alertHoldRef.current = { alert: null, lastSeenAt: 0 };
@@ -1052,7 +1108,7 @@ export default function Home() {
           setAlert(null);
           setModelBackend("");
           setModelError(
-            "หยุด AI ชั่วคราวเพื่อป้องกัน Safari ปิดหน้า กด “ลองใหม่” เพื่อเริ่มโหมดเสถียร",
+            "หยุด AI ชั่วคราวเพื่อป้องกัน Safari ปิดหน้า กด “ลองใหม่” เพื่อเริ่มใหม่",
           );
           setModelState("error");
         }
@@ -1119,7 +1175,8 @@ export default function Home() {
             modeRef.current === "drive" &&
             elapsed - lastRoadAnalysisAtRef.current >= roadInterval;
           const inferenceDue =
-            Boolean(modelRef.current) &&
+            obstacleModelReadyRef.current &&
+            Boolean(obstacleWorkerRef.current) &&
             elapsed - lastInferenceAtRef.current >=
               inferenceIntervalRef.current;
 
@@ -1250,18 +1307,6 @@ export default function Home() {
       inferenceErrorCountRef.current = 0;
       setCameraState(options.resume ? "resuming" : "requesting");
       setErrorMessage("");
-      if (
-        profile.modelDevice === "cpu" &&
-        modelRef.current?.device === "webgpu" &&
-        !inferenceBusyRef.current
-      ) {
-        modelRef.current.free();
-        modelRef.current = null;
-        modelPromiseRef.current = null;
-        setModelBackend("");
-        setModelProgress(0);
-        setModelState("idle");
-      }
       try {
         const orientation = captureOrientation();
         captureOrientationRef.current = orientation;
@@ -1283,7 +1328,7 @@ export default function Home() {
         await refreshCameraList();
         await requestWakeLock();
         runningRef.current = true;
-        void loadYolo().catch(() => undefined);
+        void loadObstacleModel().catch(() => undefined);
         saveVisionSession(
           modeRef.current,
           activeDeviceIdRef.current,
@@ -1339,7 +1384,7 @@ export default function Home() {
     },
     [
       beginVisionLoop,
-      loadYolo,
+      loadObstacleModel,
       refreshCameraList,
       requestWakeLock,
       startLocationTracking,
@@ -1409,9 +1454,12 @@ export default function Home() {
     setRuntimeLabel(recoveryProfile.ios ? "กู้คืน" : "");
     inferenceErrorCountRef.current = 0;
     inferenceIntervalRef.current = 0;
-    modelPromiseRef.current = null;
-    void loadYolo().catch(() => undefined);
-  }, [loadYolo]);
+    obstacleWorkerRef.current?.terminate();
+    obstacleWorkerRef.current = null;
+    obstacleWorkerPromiseRef.current = null;
+    obstacleModelReadyRef.current = false;
+    void loadObstacleModel().catch(() => undefined);
+  }, [loadObstacleModel]);
 
   const revealControls = useCallback(() => {
     setControlsVisible(true);
@@ -1461,7 +1509,7 @@ export default function Home() {
           video.srcObject = streamRef.current;
         }
         if (video.paused) await video.play();
-        void loadYolo().catch(() => undefined);
+        void loadObstacleModel().catch(() => undefined);
         return;
       } catch {
         // Restart the stream below if iOS did not restore playback.
@@ -1491,7 +1539,7 @@ export default function Home() {
     } finally {
       resumeInFlightRef.current = false;
     }
-  }, [loadYolo, requestWakeLock, startCamera, stopCamera]);
+  }, [loadObstacleModel, requestWakeLock, startCamera, stopCamera]);
 
   useEffect(() => {
     const onVisibilityChange = () => {
@@ -1503,7 +1551,7 @@ export default function Home() {
             true,
           );
         }
-        scheduleYoloRelease();
+        scheduleObstacleModelRelease();
         return;
       }
       if (backgroundReleaseTimerRef.current) {
@@ -1520,7 +1568,7 @@ export default function Home() {
           true,
         );
       }
-      scheduleYoloRelease();
+      scheduleObstacleModelRelease();
     };
     const onPageShow = () => {
       void restoreCameraAfterVisibility();
@@ -1533,7 +1581,7 @@ export default function Home() {
       window.removeEventListener("pagehide", onPageHide);
       window.removeEventListener("pageshow", onPageShow);
     };
-  }, [restoreCameraAfterVisibility, scheduleYoloRelease]);
+  }, [restoreCameraAfterVisibility, scheduleObstacleModelRelease]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -1625,9 +1673,11 @@ export default function Home() {
         clearTimeout(backgroundReleaseTimerRef.current);
         backgroundReleaseTimerRef.current = null;
       }
-      if (!inferenceBusyRef.current) modelRef.current?.free();
-      modelRef.current = null;
-      modelPromiseRef.current = null;
+      obstacleWorkerRef.current?.postMessage({ type: "dispose" });
+      obstacleWorkerRef.current?.terminate();
+      obstacleWorkerRef.current = null;
+      obstacleWorkerPromiseRef.current = null;
+      obstacleModelReadyRef.current = false;
       void audioContextRef.current?.close();
     },
     [stopCamera],
@@ -1639,9 +1689,9 @@ export default function Home() {
       : cameraState === "resuming"
       ? "กำลังกู้คืนกล้อง…"
       : modelState === "ready"
-      ? `${modelBackend === "webgpu" ? "GPU" : "CPU"} • ${fps ? fps.toFixed(1) : "—"} FPS${runtimeLabel ? ` • ${runtimeLabel}` : ""}`
+      ? `${modelBackend === "webgpu" ? "GPU" : "WASM"} • ${fps ? fps.toFixed(1) : "—"} FPS${runtimeLabel ? ` • ${runtimeLabel}` : ""}`
       : modelState === "loading"
-        ? `โหลด YOLO ${modelProgress}%`
+        ? `โหลด AI ${modelProgress}%`
         : modelState === "error"
           ? "AI ไม่พร้อม"
           : "เตรียม AI";
@@ -1692,7 +1742,7 @@ export default function Home() {
           </span>
           <span>
             <strong>RoadGuard</strong>
-            <small>YOLO26 VISION</small>
+            <small>FAST OBSTACLE AI</small>
           </span>
         </div>
 
@@ -1710,7 +1760,7 @@ export default function Home() {
             {liveStatus}
           </div>
         ) : (
-          <div className="privacy-pill">YOLO26 • บนเครื่อง</div>
+          <div className="privacy-pill">AI • บนเครื่อง</div>
         )}
       </header>
 
@@ -1863,7 +1913,7 @@ export default function Home() {
                 <LoaderCircle className="spin" size={25} />
               </span>
               <div>
-                <strong>กำลังเตรียม YOLO26</strong>
+                <strong>กำลังเตรียม Fast Obstacle AI</strong>
                 <span>ดาวน์โหลดโมเดล {modelProgress}%</span>
               </div>
               <div className="loader-track" aria-hidden="true">
