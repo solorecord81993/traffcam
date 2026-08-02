@@ -682,14 +682,14 @@ button:focus-visible {
   display: grid;
   width: min(calc(100% - 28px), 520px);
   min-height: 67px;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
   gap: 11px;
   padding: 10px 12px;
   transform: translateX(-50%);
-  border: 1px solid rgba(255, 171, 74, 0.5);
+  border: 1px solid rgba(255, 224, 113, 0.5);
   border-radius: 20px;
-  background: rgba(74, 38, 4, 0.82);
+  background: rgba(74, 61, 4, 0.82);
   box-shadow:
     0 14px 44px rgba(0, 0, 0, 0.32),
     0 0 0 1px rgba(255, 255, 255, 0.035) inset;
@@ -714,9 +714,9 @@ button:focus-visible {
   width: 45px;
   height: 45px;
   place-items: center;
-  color: #412000;
+  color: #3c3300;
   border-radius: 15px;
-  background: #ffb04f;
+  background: #ffe071;
 }
 
 .hazard-alert.is-danger .hazard-icon {
@@ -744,18 +744,6 @@ button:focus-visible {
   font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.hazard-distance {
-  min-width: 60px;
-  padding: 8px 9px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 12px;
-  background: rgba(0, 0, 0, 0.16);
-  color: #fff;
-  font-size: 12px;
-  font-weight: 800;
-  text-align: center;
 }
 
 .estimate-note {
@@ -1163,12 +1151,6 @@ button:focus-visible {
 
   .hazard-copy strong {
     font-size: 12px;
-  }
-
-  .hazard-distance {
-    min-width: 54px;
-    padding: 7px 6px;
-    font-size: 10px;
   }
 
   .bottom-controls {

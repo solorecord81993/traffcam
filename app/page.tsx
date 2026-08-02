@@ -32,7 +32,6 @@ import {
 } from "./road-scene";
 import {
   analyzeDetections,
-  formatDistance,
   renderVisionOverlay,
   selectAlert,
   type AnalyzedDetection,
@@ -1951,14 +1950,11 @@ export default function Home() {
                 <strong>{alert.title}</strong>
                 <small>{alert.detail}</small>
               </span>
-              <span className="hazard-distance">
-                {formatDistance(alert.distance)}
-              </span>
             </div>
           )}
 
           <div className="estimate-note">
-            GPS ระยะ และเวลาปะทะเป็นค่าประมาณ
+            สีแดง = ใกล้ • สีเหลือง = กำลังเข้ามาใกล้
           </div>
 
           <div className="bottom-controls">
@@ -2042,8 +2038,8 @@ export default function Home() {
             <ul>
               <li>ยึด iPhone ให้มั่นคงและไม่บังทัศนวิสัย</li>
               <li>อย่าถือหรือแตะหน้าจอขณะขี่หรือขับรถ</li>
-              <li>อนุญาตตำแหน่งเพื่อใช้ความเร็ว GPS ปรับระยะเตือน</li>
-              <li>GPS และระยะบนจอเป็นค่าประมาณ อาจคลาดเคลื่อนหรือขาดหาย</li>
+              <li>อนุญาตตำแหน่งเพื่อช่วยประเมินการเคลื่อนที่</li>
+              <li>สีแดงหมายถึงสิ่งกีดขวางใกล้ สีเหลืองหมายถึงมีแนวโน้มเข้ามาใกล้</li>
               <li>ภาพจะแสดงครบทั้งเฟรมที่กล้องส่งมา จึงอาจมีขอบดำเมื่อสัดส่วนหน้าจอไม่ตรงกับกล้อง</li>
               <li>เส้นเลนจะแสดงเฉพาะเมื่อพบขอบเลนซ้ายและขวาด้วยความมั่นใจเพียงพอ</li>
               <li>พื้นที่ใต้ขอบตัวรถที่ตรวจพบจะถูกตัดออก เพื่อลดการตรวจคอนโซลผิดเป็นวัตถุ</li>
