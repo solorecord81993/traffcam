@@ -170,11 +170,36 @@ function cameraConstraints(
     },
     ...(deviceId
       ? {
-          deviceId: { ideal: deviceId },
-          facingMode: { ideal: "environment" },
+          deviceId: { exact: deviceId },
         }
       : { facingMode: { ideal: "environment" } }),
   };
+}
+
+function cameraPriority(device: MediaDeviceInfo) {
+  const label = device.label.toLowerCase();
+  if (/(front|user|face|facetime|selfie|true.?depth)/i.test(label)) {
+    return 0;
+  }
+  if (
+    /(back|rear|environment|main|ultra|wide|tele|0\.5x|1x|2x|3x|5x)/i.test(
+      label,
+    )
+  ) {
+    return 2;
+  }
+  return 1;
+}
+
+function sortCameras(devices: MediaDeviceInfo[]) {
+  return devices
+    .map((device, index) => ({
+      device,
+      index,
+      priority: cameraPriority(device),
+    }))
+    .sort((left, right) => right.priority - left.priority || left.index - right.index)
+    .map(({ device }) => device);
 }
 
 function isIOSDevice() {
@@ -1172,12 +1197,22 @@ export default function Home() {
       const videoDevices = devices.filter(
         (device) => device.kind === "videoinput",
       );
-      const rearCameras = videoDevices.filter((device) =>
-        /back|rear|environment|หลัง|ultra|wide|tele/i.test(device.label),
+      const uniqueVideoDevices = videoDevices.filter(
+        (device, index, allDevices) =>
+          !device.deviceId ||
+          allDevices.findIndex(
+            (candidate) => candidate.deviceId === device.deviceId,
+          ) === index,
       );
-      setCameras(rearCameras.length ? rearCameras : videoDevices);
+      const orderedCameras = sortCameras(uniqueVideoDevices);
+      setCameras(orderedCameras);
+      const activeIndex = orderedCameras.findIndex(
+        (device) => device.deviceId === activeDeviceIdRef.current,
+      );
+      setCameraIndex(activeIndex >= 0 ? activeIndex : 0);
     } catch {
       setCameras([]);
+      setCameraIndex(0);
     }
   }, []);
 
@@ -1315,10 +1350,28 @@ export default function Home() {
 
   const cycleCamera = useCallback(async () => {
     if (cameras.length < 2) return;
-    const nextIndex = (cameraIndex + 1) % cameras.length;
+    const activeIndex = cameras.findIndex(
+      (device) => device.deviceId === activeDeviceIdRef.current,
+    );
+    const currentIndex = activeIndex >= 0 ? activeIndex : cameraIndex;
+    const nextIndex = (currentIndex + 1) % cameras.length;
+    const nextCamera = cameras[nextIndex];
+    if (!nextCamera?.deviceId) return;
     setCameraIndex(nextIndex);
-    await startCamera(cameras[nextIndex]?.deviceId, { resume: true });
+    await startCamera(nextCamera.deviceId, { resume: true });
   }, [cameraIndex, cameras, startCamera]);
+
+  useEffect(() => {
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices?.addEventListener) return;
+    const handleDeviceChange = () => {
+      void refreshCameraList();
+    };
+    mediaDevices.addEventListener("devicechange", handleDeviceChange);
+    return () => {
+      mediaDevices.removeEventListener("devicechange", handleDeviceChange);
+    };
+  }, [refreshCameraList]);
 
   const resumeCamera = useCallback(async () => {
     if (resumeInFlightRef.current) {
