@@ -550,12 +550,21 @@ function traceNormalizedPoints(
   width: number,
   height: number,
 ) {
-  points.forEach((point, index) => {
-    const x = point.x * width;
-    const y = point.y * height;
-    if (index === 0) context.moveTo(x, y);
-    else context.lineTo(x, y);
-  });
+  if (!points.length) return;
+  context.moveTo(points[0].x * width, points[0].y * height);
+  if (points.length === 1) return;
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const point = points[index];
+    const next = points[index + 1];
+    context.quadraticCurveTo(
+      point.x * width,
+      point.y * height,
+      ((point.x + next.x) / 2) * width,
+      ((point.y + next.y) / 2) * height,
+    );
+  }
+  const last = points[points.length - 1];
+  context.lineTo(last.x * width, last.y * height);
 }
 
 function drawDashboardMask(

@@ -216,6 +216,14 @@ button:focus-visible {
   backdrop-filter: blur(18px);
 }
 
+.live-status {
+  max-width: calc(100vw - 150px);
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .live-status.model-error {
   color: #ffd3d8;
   border-color: rgba(255, 79, 100, 0.32);
@@ -513,6 +521,26 @@ button:focus-visible {
   color: #768592;
   font-size: 11px;
   cursor: pointer;
+}
+
+.welcome-links {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+
+.welcome-links .safety-link + .safety-link {
+  position: relative;
+}
+
+.welcome-links .safety-link + .safety-link::before {
+  position: absolute;
+  left: -7px;
+  width: 1px;
+  height: 13px;
+  background: rgba(255, 255, 255, 0.1);
+  content: "";
 }
 
 .mode-badge {
@@ -932,6 +960,84 @@ button:focus-visible {
   margin: 0;
 }
 
+.performance-sheet {
+  max-height: min(720px, calc(100dvh - 36px));
+  overflow-y: auto;
+}
+
+.frame-rate-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+  margin: 18px 0 13px;
+}
+
+.frame-rate-options button {
+  display: grid;
+  min-height: 91px;
+  place-content: center;
+  gap: 1px;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 17px;
+  background: rgba(255, 255, 255, 0.045);
+  color: #d7e0e6;
+  cursor: pointer;
+}
+
+.frame-rate-options button.is-active {
+  border-color: rgba(116, 247, 197, 0.58);
+  background: rgba(116, 247, 197, 0.12);
+  color: #c9ffed;
+  box-shadow: 0 0 0 1px rgba(116, 247, 197, 0.08) inset;
+}
+
+.frame-rate-options strong {
+  font-size: 25px;
+  line-height: 1;
+}
+
+.frame-rate-options span {
+  color: #91a0aa;
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.1em;
+}
+
+.frame-rate-options small {
+  margin-top: 5px;
+  color: #71808b;
+  font-size: 9px;
+}
+
+.frame-rate-options button.is-active span,
+.frame-rate-options button.is-active small {
+  color: #8fe9cb;
+}
+
+.performance-reading {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 13px;
+}
+
+.performance-reading span {
+  padding: 8px 5px;
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.04);
+  color: #aebac2;
+  font-size: 9px;
+  font-weight: 650;
+  text-align: center;
+}
+
+.info-sheet .performance-note {
+  margin: 0 0 16px;
+  color: #7e8c96;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
 .info-sheet ul {
   display: grid;
   gap: 6px;
@@ -1108,6 +1214,12 @@ button:focus-visible {
 }
 
 @media (max-width: 430px) {
+  .live-status {
+    min-height: 30px;
+    padding: 0 8px;
+    font-size: 9px;
+  }
+
   .privacy-pill {
     padding: 0 9px;
     font-size: 9px;

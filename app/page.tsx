@@ -6,11 +6,13 @@ import {
   Camera,
   CarFront,
   Footprints,
+  Gauge,
   Info,
   LoaderCircle,
   Maximize2,
   Navigation,
   RefreshCw,
+  Settings2,
   ShieldCheck,
   Volume2,
   VolumeX,
@@ -48,6 +50,7 @@ type CameraState =
   | "running"
   | "error";
 type ModelState = "idle" | "loading" | "ready" | "error";
+type FrameRateTarget = 30 | 45 | 60;
 type GpsState =
   | "idle"
   | "locating"
@@ -111,8 +114,10 @@ type WorkerResolver = {
 };
 
 const VISION_SESSION_KEY = "roadguard-vision-session-v3";
+const FRAME_RATE_TARGET_KEY = "roadguard-frame-rate-target-v1";
 const VISION_SESSION_MAX_AGE = 4 * 60 * 60 * 1000;
 const CAMERA_REQUEST_TIMEOUT = 15000;
+const FRAME_RATE_TARGETS = [30, 45, 60] as const;
 const DEFAULT_RUNTIME_PROFILE: RuntimeProfile = {
   ios: false,
   recovery: false,
@@ -310,19 +315,44 @@ function clearVisionSession() {
   }
 }
 
-function selectRuntimeProfile(recovery: boolean): RuntimeProfile {
-  if (!isIOSDevice()) return DEFAULT_RUNTIME_PROFILE;
+function selectRuntimeProfile(
+  recovery: boolean,
+  frameRateTarget: FrameRateTarget,
+): RuntimeProfile {
+  const overlayInterval = 1000 / frameRateTarget;
+  const roadIntervalMoving =
+    frameRateTarget === 60 ? 50 : frameRateTarget === 45 ? 66 : 100;
+  const roadIntervalStopped =
+    frameRateTarget === 60 ? 90 : frameRateTarget === 45 ? 120 : 180;
+  const inferenceMovingCooldown =
+    frameRateTarget === 60 ? 16 : frameRateTarget === 45 ? 38 : 80;
+  const inferenceStoppedCooldown =
+    frameRateTarget === 60 ? 55 : frameRateTarget === 45 ? 95 : 180;
+  const roadMax = frameRateTarget === 60 ? 336 : 320;
+
+  if (!isIOSDevice()) {
+    return {
+      ...DEFAULT_RUNTIME_PROFILE,
+      cameraMaxFps: frameRateTarget,
+      roadMax,
+      roadIntervalMoving,
+      roadIntervalStopped,
+      overlayInterval,
+      inferenceMovingCooldown,
+      inferenceStoppedCooldown,
+    };
+  }
   if (recovery) {
     return {
       ios: true,
       recovery: true,
       cameraMaxWidth: 720,
-      cameraMaxFps: 24,
+      cameraMaxFps: Math.min(30, frameRateTarget),
       inputMax: 288,
       overlayMax: 960,
-      roadMax: 208,
-      roadIntervalMoving: 140,
-      roadIntervalStopped: 240,
+      roadMax: 256,
+      roadIntervalMoving: Math.max(100, roadIntervalMoving),
+      roadIntervalStopped: Math.max(180, roadIntervalStopped),
       overlayInterval: 33,
       inferenceMovingCooldown: 180,
       inferenceStoppedCooldown: 300,
@@ -332,15 +362,15 @@ function selectRuntimeProfile(recovery: boolean): RuntimeProfile {
     ios: true,
     recovery: false,
     cameraMaxWidth: 1280,
-    cameraMaxFps: 30,
+    cameraMaxFps: frameRateTarget,
     inputMax: 360,
     overlayMax: 1280,
-    roadMax: 256,
-    roadIntervalMoving: 100,
-    roadIntervalStopped: 180,
-    overlayInterval: 33,
-    inferenceMovingCooldown: 80,
-    inferenceStoppedCooldown: 180,
+    roadMax,
+    roadIntervalMoving,
+    roadIntervalStopped,
+    overlayInterval,
+    inferenceMovingCooldown,
+    inferenceStoppedCooldown,
   };
 }
 
@@ -503,6 +533,8 @@ export default function Home() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const lastAudioAlertRef = useRef({ key: "", level: "", at: 0 });
   const statsRef = useRef({ startedAt: 0, frames: 0 });
+  const displayStatsRef = useRef({ startedAt: 0, frames: 0 });
+  const frameRateTargetRef = useRef<FrameRateTarget>(30);
   const runtimeProfileRef = useRef<RuntimeProfile>(
     DEFAULT_RUNTIME_PROFILE,
   );
@@ -519,9 +551,14 @@ export default function Home() {
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [controlsVisible, setControlsVisible] = useState(true);
   const [showInfo, setShowInfo] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
   const [cameraIndex, setCameraIndex] = useState(0);
   const [fps, setFps] = useState(0);
+  const [displayFps, setDisplayFps] = useState(0);
+  const [cameraFps, setCameraFps] = useState(0);
+  const [frameRateTarget, setFrameRateTarget] =
+    useState<FrameRateTarget>(30);
   const [detectedCount, setDetectedCount] = useState(0);
   const [alert, setAlert] = useState<VisionAlert | null>(null);
   const [gpsState, setGpsState] = useState<GpsState>("idle");
@@ -538,6 +575,16 @@ export default function Home() {
     () => Object.entries(MODES) as [TravelMode, (typeof MODES)[TravelMode]][],
     [],
   );
+
+  useEffect(() => {
+    const storage = browserStorage("localStorage");
+    const stored = Number(storage?.getItem(FRAME_RATE_TARGET_KEY));
+    if (!FRAME_RATE_TARGETS.includes(stored as FrameRateTarget)) return;
+    const target = stored as FrameRateTarget;
+    frameRateTargetRef.current = target;
+    const timer = window.setTimeout(() => setFrameRateTarget(target), 0);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   const changeMode = useCallback((nextMode: TravelMode) => {
     if (modeRef.current === nextMode) return;
@@ -920,12 +967,15 @@ export default function Home() {
     }
     inferenceErrorCountRef.current = 0;
     statsRef.current = { startedAt: 0, frames: 0 };
+    displayStatsRef.current = { startedAt: 0, frames: 0 };
     alertRef.current = null;
     alertHoldRef.current = { alert: null, lastSeenAt: 0 };
     trackStoreRef.current = { nextId: 1, tracks: new Map() };
     setAlert(null);
     setDetectedCount(0);
     setFps(0);
+    setDisplayFps(0);
+    setCameraFps(0);
     if (resetUi) setCameraState("idle");
   }, [stopLocationTracking]);
 
@@ -1238,6 +1288,18 @@ export default function Home() {
               analysisDimensions.width,
               analysisDimensions.height,
             );
+            const displayStats = displayStatsRef.current;
+            if (!displayStats.startedAt) {
+              displayStats.startedAt = elapsed;
+            }
+            displayStats.frames += 1;
+            const displayStatsElapsed = elapsed - displayStats.startedAt;
+            if (displayStatsElapsed >= 1200) {
+              setDisplayFps(
+                (displayStats.frames * 1000) / displayStatsElapsed,
+              );
+              displayStatsRef.current = { startedAt: elapsed, frames: 0 };
+            }
           }
         }
         animationRef.current = requestAnimationFrame(frame);
@@ -1288,13 +1350,18 @@ export default function Home() {
         ? true
         : (recoveryCheckedRef.current ?? hadUncleanVisionSession());
       recoveryCheckedRef.current = recovery;
-      const profile = selectRuntimeProfile(recovery);
+      const profile = selectRuntimeProfile(
+        recovery,
+        frameRateTargetRef.current,
+      );
       runtimeProfileRef.current = profile;
       setRuntimeLabel(
         profile.recovery
           ? "กู้คืน"
           : profile.ios
-            ? "เสถียร"
+            ? frameRateTargetRef.current === 60
+              ? "สูงสุด"
+              : "เสถียร"
             : "",
       );
       stopCamera({ clearSession: false, resetUi: false });
@@ -1317,6 +1384,12 @@ export default function Home() {
         streamRef.current = stream;
         const cameraTrack = stream.getVideoTracks()[0];
         if (cameraTrack) await resetCameraZoom(cameraTrack);
+        setCameraFps(
+          Math.round(
+            cameraTrack?.getSettings().frameRate ??
+              profile.cameraMaxFps,
+          ),
+        );
         activeDeviceIdRef.current =
           cameraTrack?.getSettings().deviceId || deviceId;
         const video = videoRef.current;
@@ -1447,8 +1520,66 @@ export default function Home() {
     if (!next) window.speechSynthesis?.cancel();
   }, [unlockAudio]);
 
+  const applyFrameRateTarget = useCallback(
+    async (nextTarget: FrameRateTarget) => {
+      frameRateTargetRef.current = nextTarget;
+      setFrameRateTarget(nextTarget);
+      try {
+        browserStorage("localStorage")?.setItem(
+          FRAME_RATE_TARGET_KEY,
+          String(nextTarget),
+        );
+      } catch {
+        // Storage can be disabled in private browsing.
+      }
+
+      const recovery = recoveryCheckedRef.current ?? false;
+      const profile = selectRuntimeProfile(recovery, nextTarget);
+      runtimeProfileRef.current = profile;
+      lastInferenceAtRef.current = 0;
+      lastOverlayAtRef.current = 0;
+      lastRoadAnalysisAtRef.current = 0;
+      inferenceIntervalRef.current = 0;
+      displayStatsRef.current = { startedAt: 0, frames: 0 };
+      setDisplayFps(0);
+      setRuntimeLabel(
+        profile.recovery
+          ? "กู้คืน"
+          : profile.ios
+            ? nextTarget === 60
+              ? "สูงสุด"
+              : "เสถียร"
+            : "",
+      );
+
+      const track = streamRef.current?.getVideoTracks()[0];
+      if (track) {
+        try {
+          await track.applyConstraints({
+            frameRate: {
+              ideal: profile.cameraMaxFps,
+              max: profile.cameraMaxFps,
+            },
+          });
+        } catch (error) {
+          console.warn("Camera frame-rate change was not accepted", error);
+        }
+        setCameraFps(
+          Math.round(
+            track.getSettings().frameRate ?? profile.cameraMaxFps,
+          ),
+        );
+      }
+      setShowSettings(false);
+    },
+    [],
+  );
+
   const retryModel = useCallback(() => {
-    const recoveryProfile = selectRuntimeProfile(true);
+    const recoveryProfile = selectRuntimeProfile(
+      true,
+      frameRateTargetRef.current,
+    );
     runtimeProfileRef.current = recoveryProfile;
     setRuntimeLabel(recoveryProfile.ios ? "กู้คืน" : "");
     inferenceErrorCountRef.current = 0;
@@ -1463,10 +1594,10 @@ export default function Home() {
   const revealControls = useCallback(() => {
     setControlsVisible(true);
     if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
-    if (isRunning && !showInfo) {
+    if (isRunning && !showInfo && !showSettings) {
       hideTimerRef.current = setTimeout(() => setControlsVisible(false), 5000);
     }
-  }, [isRunning, showInfo]);
+  }, [isRunning, showInfo, showSettings]);
 
   const enterFullscreen = useCallback(async () => {
     try {
@@ -1688,7 +1819,7 @@ export default function Home() {
       : cameraState === "resuming"
       ? "กำลังกู้คืนกล้อง…"
       : modelState === "ready"
-      ? `${modelBackend === "webgpu" ? "GPU" : "WASM"} • ${fps ? fps.toFixed(1) : "—"} FPS${runtimeLabel ? ` • ${runtimeLabel}` : ""}`
+      ? `${modelBackend === "webgpu" ? "GPU" : "WASM"} • จอ${displayFps ? Math.min(frameRateTarget, Math.round(displayFps)) : "—"} • AI${fps ? fps.toFixed(1) : "—"} FPS${runtimeLabel ? ` • ${runtimeLabel}` : ""}`
       : modelState === "loading"
         ? `โหลด AI ${modelProgress}%`
         : modelState === "error"
@@ -1832,14 +1963,24 @@ export default function Home() {
             </p>
           )}
 
-          <button
-            className="safety-link"
-            type="button"
-            onClick={() => setShowInfo(true)}
-          >
-            <Info size={16} />
-            อ่านก่อนใช้งาน
-          </button>
+          <div className="welcome-links">
+            <button
+              className="safety-link"
+              type="button"
+              onClick={() => setShowSettings(true)}
+            >
+              <Settings2 size={16} />
+              ตั้งค่า {frameRateTarget} FPS
+            </button>
+            <button
+              className="safety-link"
+              type="button"
+              onClick={() => setShowInfo(true)}
+            >
+              <Info size={16} />
+              อ่านก่อนใช้งาน
+            </button>
+          </div>
         </section>
       )}
 
@@ -1977,6 +2118,13 @@ export default function Home() {
             <div className="utility-controls">
               <button
                 type="button"
+                onClick={() => setShowSettings(true)}
+                aria-label="ตั้งค่าความลื่นไหล"
+              >
+                <Settings2 size={21} />
+              </button>
+              <button
+                type="button"
                 onClick={() => void toggleSound()}
                 aria-label={soundEnabled ? "ปิดเสียงเตือน" : "เปิดเสียงเตือน"}
               >
@@ -2008,6 +2156,71 @@ export default function Home() {
             </div>
           </div>
         </>
+      )}
+
+      {showSettings && (
+        <div className="sheet-backdrop" role="presentation">
+          <section
+            className="info-sheet performance-sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="performance-title"
+          >
+            <button
+              className="sheet-close"
+              type="button"
+              onClick={() => setShowSettings(false)}
+              aria-label="ปิด"
+            >
+              <X size={21} />
+            </button>
+            <span className="sheet-icon">
+              <Gauge size={28} />
+            </span>
+            <h2 id="performance-title">ความลื่นไหลและการตรวจจับ</h2>
+            <p>
+              เลือกอัตราภาพกล้องและการวาดผลบนจอ ระบบจะเร่งการตรวจเลน
+              และส่งภาพเข้า AI ถี่ที่สุดเท่าที่เครื่องทำได้
+            </p>
+            <div className="frame-rate-options" aria-label="เลือก FPS เป้าหมาย">
+              {FRAME_RATE_TARGETS.map((target) => (
+                <button
+                  key={target}
+                  type="button"
+                  className={frameRateTarget === target ? "is-active" : ""}
+                  onClick={() => void applyFrameRateTarget(target)}
+                  aria-pressed={frameRateTarget === target}
+                >
+                  <strong>{target}</strong>
+                  <span>FPS</span>
+                  <small>
+                    {target === 30
+                      ? "ประหยัด"
+                      : target === 45
+                        ? "เร็ว"
+                        : "สูงสุด"}
+                  </small>
+                </button>
+              ))}
+            </div>
+            <div className="performance-reading" role="status">
+              <span>กล้องจริง {cameraFps || "—"} FPS</span>
+              <span>จอ {displayFps ? Math.round(displayFps) : "—"} FPS</span>
+              <span>AI {fps ? fps.toFixed(1) : "—"} FPS</span>
+            </div>
+            <p className="performance-note">
+              60 FPS จะทำงานเมื่อกล้องและ Safari รองรับ ส่วน AI อาจต่ำกว่า 60
+              เพราะขึ้นกับความเร็วโมเดล เครื่องอาจร้อนและใช้แบตมากขึ้น
+            </p>
+            <button
+              className="sheet-confirm"
+              type="button"
+              onClick={() => setShowSettings(false)}
+            >
+              ใช้ค่าปัจจุบัน
+            </button>
+          </section>
+        </div>
       )}
 
       {showInfo && (

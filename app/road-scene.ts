@@ -50,6 +50,12 @@ type FittedLine = {
   support: EdgePoint[];
 };
 
+type TracedBoundary = {
+  points: NormalizedPoint[];
+  confidence: number;
+  observedRatio: number;
+};
+
 const EMPTY_SCENE: RoadScene = {
   lane: null,
   dashboard: null,
@@ -446,46 +452,154 @@ function fitLaneLine(
   return { slope, intercept, confidence, support };
 }
 
-function traceBoundary(
-  line: FittedLine,
+function traceBoundaryFromImage(
+  allEdges: EdgePoint[],
+  seed: FittedLine,
+  side: "left" | "right",
   topY: number,
   bottomY: number,
-) {
-  const points: NormalizedPoint[] = [];
-  const samples = 7;
-  for (let index = 0; index < samples; index += 1) {
-    const y = interpolate(topY, bottomY, index / (samples - 1));
-    const predictedX = line.slope * y + line.intercept;
-    const nearby = line.support.filter(
-      (point) =>
-        Math.abs(point.y - y) <= 0.045 &&
-        Math.abs(point.x - predictedX) <= 0.06,
-    );
-    let observedX = predictedX;
-    if (nearby.length) {
-      let total = 0;
-      let weightedX = 0;
-      for (const point of nearby) {
-        const proximity =
-          1 - Math.abs(point.y - y) / 0.045;
-        const weight = point.weight * Math.max(0.15, proximity);
-        total += weight;
-        weightedX += point.x * weight;
-      }
-      observedX = weightedX / Math.max(0.001, total);
-    }
-    points.push({
-      x: clamp(
-        predictedX * 0.46 +
-          clamp(observedX, predictedX - 0.055, predictedX + 0.055) *
-            0.54,
-        -0.05,
-        1.05,
-      ),
-      y,
+): TracedBoundary {
+  // The straight Hough line is only a coarse starting point. From there,
+  // follow the strongest connected edge band-by-band from the foreground
+  // towards the horizon, allowing the observed boundary to bend away from
+  // the seed. This preserves real curves instead of drawing the seed line.
+  const samples = 13;
+  const traced = new Array<NormalizedPoint>(samples);
+  let observedBands = 0;
+  let paintedBands = 0;
+  let previousOffset = 0;
+  let offsetVelocity = 0;
+
+  for (let index = samples - 1; index >= 0; index -= 1) {
+    const progress = index / (samples - 1);
+    const y = interpolate(topY, bottomY, progress);
+    const seedX = seed.slope * y + seed.intercept;
+    const predictedOffset = previousOffset + offsetVelocity * 0.62;
+    const predictedX = seedX + predictedOffset;
+    const yRadius = interpolate(0.026, 0.044, progress);
+    const searchRadius = interpolate(0.065, 0.145, progress);
+    const clusterRadius = interpolate(0.014, 0.027, progress);
+    const candidates = allEdges.filter((point) => {
+      if (Math.abs(point.y - y) > yRadius) return false;
+      if (Math.abs(point.x - predictedX) > searchRadius) return false;
+      if (side === "left" && point.x > 0.69) return false;
+      if (side === "right" && point.x < 0.31) return false;
+      return true;
     });
+
+    let observedX: number | null = null;
+    let observedPaint = 0;
+    if (candidates.length) {
+      const binCount = 48;
+      const densityBins = new Float32Array(binCount);
+      const searchStart = predictedX - searchRadius;
+      const searchWidth = searchRadius * 2;
+      for (const point of candidates) {
+        const bin = clamp(
+          Math.floor(((point.x - searchStart) / searchWidth) * binCount),
+          0,
+          binCount - 1,
+        );
+        const verticalProximity =
+          1 - Math.abs(point.y - y) / Math.max(0.001, yRadius);
+        const predictionProximity =
+          1 -
+          Math.abs(point.x - predictedX) /
+            Math.max(0.001, searchRadius);
+        densityBins[bin] +=
+          point.weight *
+          (point.paint ? 1.3 : 0.82) *
+          Math.max(0.12, verticalProximity) *
+          Math.max(0.16, predictionProximity);
+      }
+
+      let bestBin = -1;
+      let bestDensity = 0;
+      for (let bin = 0; bin < binCount; bin += 1) {
+        const density =
+          densityBins[bin] +
+          (densityBins[bin - 1] ?? 0) * 0.55 +
+          (densityBins[bin + 1] ?? 0) * 0.55;
+        if (density > bestDensity) {
+          bestDensity = density;
+          bestBin = bin;
+        }
+      }
+
+      if (bestBin >= 0 && bestDensity >= 1.25) {
+        const anchorX =
+          searchStart + ((bestBin + 0.5) / binCount) * searchWidth;
+        let total = 0;
+        let weightedX = 0;
+        let paintTotal = 0;
+        for (const point of candidates) {
+          const horizontalDistance = Math.abs(point.x - anchorX);
+          if (horizontalDistance > clusterRadius) continue;
+          const weight =
+            point.weight *
+            Math.max(0.15, 1 - horizontalDistance / clusterRadius);
+          total += weight;
+          weightedX += point.x * weight;
+          paintTotal += point.paint * weight;
+        }
+        if (total > 0) {
+          observedX = weightedX / total;
+          observedPaint = paintTotal / total;
+        }
+      }
+    }
+
+    let nextOffset = predictedOffset;
+    if (observedX !== null) {
+      observedBands += 1;
+      if (observedPaint >= 0.34) paintedBands += 1;
+      const measuredOffset = clamp(
+        observedX - seedX,
+        -searchRadius,
+        searchRadius,
+      );
+      const observationWeight = observedPaint >= 0.34 ? 0.82 : 0.68;
+      nextOffset = interpolate(
+        predictedOffset,
+        measuredOffset,
+        observationWeight,
+      );
+    } else {
+      // Missing paint or a dashed line can create a short gap. Continue the
+      // local curve through the gap, but gently return towards the seed.
+      nextOffset *= 0.86;
+    }
+
+    offsetVelocity = clamp(nextOffset - previousOffset, -0.055, 0.055);
+    previousOffset = nextOffset;
+    traced[index] = {
+      x: clamp(seedX + nextOffset, -0.06, 1.06),
+      y,
+    };
   }
-  return points;
+
+  // A light three-point filter removes single-pixel jitter while retaining
+  // the multi-band curve captured from the current camera frame.
+  const points = traced.map((point, index, source) => {
+    if (index === 0 || index === source.length - 1) return point;
+    return {
+      x:
+        source[index - 1].x * 0.18 +
+        point.x * 0.64 +
+        source[index + 1].x * 0.18,
+      y: point.y,
+    };
+  });
+  const observedRatio = observedBands / samples;
+  const paintRatio = paintedBands / Math.max(1, observedBands);
+  const confidence = clamp(
+    seed.confidence * 0.38 +
+      observedRatio * 0.47 +
+      paintRatio * 0.15,
+    0,
+    1,
+  );
+  return { points, confidence, observedRatio };
 }
 
 function detectLane(
@@ -534,10 +648,31 @@ function detectLane(
     0.35,
     Math.min(0.62, roadBottom - 0.22),
   );
-  const leftTop = left.slope * topY + left.intercept;
-  const rightTop = right.slope * topY + right.intercept;
-  const leftBottom = left.slope * roadBottom + left.intercept;
-  const rightBottom = right.slope * roadBottom + right.intercept;
+  const leftTrace = traceBoundaryFromImage(
+    edgePoints,
+    left,
+    "left",
+    topY,
+    roadBottom,
+  );
+  const rightTrace = traceBoundaryFromImage(
+    edgePoints,
+    right,
+    "right",
+    topY,
+    roadBottom,
+  );
+  if (
+    leftTrace.observedRatio < 0.38 ||
+    rightTrace.observedRatio < 0.38
+  ) {
+    return null;
+  }
+
+  const leftTop = leftTrace.points[0].x;
+  const rightTop = rightTrace.points[0].x;
+  const leftBottom = leftTrace.points[leftTrace.points.length - 1].x;
+  const rightBottom = rightTrace.points[rightTrace.points.length - 1].x;
   const topWidth = rightTop - leftTop;
   const bottomWidth = rightBottom - leftBottom;
   const bottomCenter = (leftBottom + rightBottom) / 2;
@@ -564,16 +699,26 @@ function detectLane(
   );
   if (perspectiveGrowth < 1.18 || geometryConfidence < 0.38) return null;
 
+  const widths = leftTrace.points.map(
+    (point, index) => rightTrace.points[index].x - point.x,
+  );
+  if (widths.some((widthAtBand) => widthAtBand <= 0.018)) return null;
+  let severeNarrowing = 0;
+  for (let index = 1; index < widths.length; index += 1) {
+    if (widths[index] + 0.035 < widths[index - 1]) severeNarrowing += 1;
+  }
+  if (severeNarrowing > 2) return null;
+
   const confidence = clamp(
-    Math.min(left.confidence, right.confidence) * 0.72 +
+    Math.min(leftTrace.confidence, rightTrace.confidence) * 0.72 +
       geometryConfidence * 0.28,
     0,
     1,
   );
   if (confidence < 0.34) return null;
   return {
-    left: { points: traceBoundary(left, topY, roadBottom) },
-    right: { points: traceBoundary(right, topY, roadBottom) },
+    left: { points: leftTrace.points },
+    right: { points: rightTrace.points },
     topY,
     bottomY: roadBottom,
     confidence,
