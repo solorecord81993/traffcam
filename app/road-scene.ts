@@ -31,6 +31,9 @@ export type RoadSceneTracker = {
   lane: DetectedLane | null;
   laneEvidence: number;
   laneMisses: number;
+  laneModel: DetectedLane | null;
+  laneModelEvidence: number;
+  laneModelOutliers: number;
   dashboard: DashboardMask | null;
   dashboardEvidence: number;
   scratchPixels: Uint8ClampedArray | null;
@@ -86,6 +89,9 @@ export function createRoadSceneTracker(): RoadSceneTracker {
     lane: null,
     laneEvidence: 0,
     laneMisses: 0,
+    laneModel: null,
+    laneModelEvidence: 0,
+    laneModelOutliers: 0,
     dashboard: null,
     dashboardEvidence: 0,
     scratchPixels: null,
@@ -1073,6 +1079,230 @@ function blendPoints(
   });
 }
 
+function limitSeriesShape(
+  values: number[],
+  points: NormalizedPoint[],
+  topCurvature: number,
+  bottomCurvature: number,
+  maximumSlope: number,
+) {
+  const result = [...values];
+  for (let pass = 0; pass < 3; pass += 1) {
+    const source = [...result];
+    for (let index = 1; index < source.length - 1; index += 1) {
+      const previousY = points[index - 1].y;
+      const nextY = points[index + 1].y;
+      const progress = index / Math.max(1, source.length - 1);
+      const localProgress =
+        (points[index].y - previousY) /
+        Math.max(0.0001, nextY - previousY);
+      const locallyStraight = interpolate(
+        source[index - 1],
+        source[index + 1],
+        localProgress,
+      );
+      const curvatureLimit = interpolate(
+        topCurvature,
+        bottomCurvature,
+        progress,
+      );
+      result[index] =
+        locallyStraight +
+        clamp(
+          source[index] - locallyStraight,
+          -curvatureLimit,
+          curvatureLimit,
+        );
+    }
+  }
+
+  // A road boundary may curve, but its tangent cannot rotate abruptly from
+  // one vertical sample to the next. This rules out near-horizontal hooks
+  // caused by a vehicle edge while preserving gradual bends in the road.
+  for (let index = 1; index < result.length; index += 1) {
+    const deltaY = Math.max(
+      0.0001,
+      points[index].y - points[index - 1].y,
+    );
+    const maximumDelta = maximumSlope * deltaY;
+    result[index] = clamp(
+      result[index],
+      result[index - 1] - maximumDelta,
+      result[index - 1] + maximumDelta,
+    );
+  }
+  for (let index = result.length - 2; index >= 0; index -= 1) {
+    const deltaY = Math.max(
+      0.0001,
+      points[index + 1].y - points[index].y,
+    );
+    const maximumDelta = maximumSlope * deltaY;
+    result[index] = clamp(
+      result[index],
+      result[index + 1] - maximumDelta,
+      result[index + 1] + maximumDelta,
+    );
+  }
+  return result;
+}
+
+function constrainLaneShape(
+  lane: DetectedLane,
+  learned: DetectedLane | null,
+) {
+  const centers: number[] = [];
+  const widths: number[] = [];
+
+  for (let index = 0; index < lane.left.points.length; index += 1) {
+    const y = lane.left.points[index].y;
+    const left = lane.left.points[index].x;
+    const right = lane.right.points[index]?.x ?? left + 0.02;
+    let center = (left + right) / 2;
+    let widthAtBand = Math.max(0.018, right - left);
+
+    if (learned) {
+      const learnedBounds = laneBoundsAt(learned, y);
+      const learnedCenter =
+        (learnedBounds.left + learnedBounds.right) / 2;
+      const learnedWidth = learnedBounds.right - learnedBounds.left;
+      const centerPull = clamp(
+        (Math.abs(center - learnedCenter) - 0.018) / 0.12,
+        0,
+        0.52,
+      );
+      const widthPull = clamp(
+        (Math.abs(widthAtBand - learnedWidth) - 0.025) / 0.16,
+        0,
+        0.58,
+      );
+      center = interpolate(center, learnedCenter, centerPull);
+      widthAtBand = interpolate(widthAtBand, learnedWidth, widthPull);
+    }
+    centers.push(center);
+    widths.push(widthAtBand);
+  }
+
+  const smoothCenters = limitSeriesShape(
+    centers,
+    lane.left.points,
+    0.008,
+    0.022,
+    1.35,
+  );
+  const smoothWidths = limitSeriesShape(
+    widths,
+    lane.left.points,
+    0.012,
+    0.034,
+    2.2,
+  );
+  for (let index = 1; index < smoothWidths.length; index += 1) {
+    smoothWidths[index] = Math.max(
+      smoothWidths[index],
+      smoothWidths[index - 1] * 0.86,
+    );
+  }
+
+  return {
+    ...lane,
+    left: {
+      points: lane.left.points.map((point, index) => ({
+        x: smoothCenters[index] -
+          clamp(smoothWidths[index], 0.018, 1.04) / 2,
+        y: point.y,
+      })),
+    },
+    right: {
+      points: lane.right.points.map((point, index) => ({
+        x: smoothCenters[index] +
+          clamp(smoothWidths[index], 0.018, 1.04) / 2,
+        y: point.y,
+      })),
+    },
+  } satisfies DetectedLane;
+}
+
+function blendLanes(
+  current: DetectedLane,
+  previous: DetectedLane,
+  currentWeight: number,
+) {
+  const left: NormalizedPoint[] = [];
+  const right: NormalizedPoint[] = [];
+  for (const point of current.left.points) {
+    const oldBounds = laneBoundsAt(previous, point.y);
+    left.push({
+      x: interpolate(oldBounds.left, point.x, currentWeight),
+      y: point.y,
+    });
+  }
+  for (const point of current.right.points) {
+    const oldBounds = laneBoundsAt(previous, point.y);
+    right.push({
+      x: interpolate(oldBounds.right, point.x, currentWeight),
+      y: point.y,
+    });
+  }
+  return {
+    left: { points: left },
+    right: { points: right },
+    topY: interpolate(previous.topY, current.topY, currentWeight),
+    bottomY: interpolate(previous.bottomY, current.bottomY, currentWeight),
+    confidence: interpolate(
+      previous.confidence,
+      current.confidence,
+      currentWeight,
+    ),
+  } satisfies DetectedLane;
+}
+
+function learnLaneShape(
+  measurement: DetectedLane,
+  tracker: RoadSceneTracker,
+  reset = false,
+) {
+  if (!tracker.laneModel || reset) {
+    tracker.laneModel = constrainLaneShape(measurement, null);
+    tracker.laneModelEvidence = 1;
+    tracker.laneModelOutliers = 0;
+    return;
+  }
+
+  const difference =
+    (averagePointDifference(
+      measurement.left.points,
+      tracker.laneModel.left.points,
+    ) +
+      averagePointDifference(
+        measurement.right.points,
+        tracker.laneModel.right.points,
+      )) /
+    2;
+  if (difference > 0.12 || measurement.confidence < 0.38) {
+    tracker.laneModelOutliers += 1;
+    tracker.laneModelEvidence = Math.max(
+      0,
+      tracker.laneModelEvidence - 1,
+    );
+    return;
+  }
+
+  tracker.laneModelOutliers = 0;
+  tracker.laneModelEvidence = Math.min(
+    30,
+    tracker.laneModelEvidence + 1,
+  );
+  const learningRate = clamp(
+    0.2 + measurement.confidence * 0.13,
+    0.22,
+    0.34,
+  );
+  tracker.laneModel = constrainLaneShape(
+    blendLanes(measurement, tracker.laneModel, learningRate),
+    null,
+  );
+}
+
 function stabilizeDashboard(
   raw: DashboardMask | null,
   tracker: RoadSceneTracker,
@@ -1117,27 +1347,48 @@ function stabilizeLane(
     }
     tracker.lane = null;
     tracker.laneEvidence = 0;
+    if (tracker.laneMisses > 8) {
+      tracker.laneModel = null;
+      tracker.laneModelEvidence = 0;
+      tracker.laneModelOutliers = 0;
+    }
     return null;
   }
 
   const previous = tracker.lane;
+  const learned =
+    tracker.laneModel && tracker.laneModelEvidence >= 2
+      ? tracker.laneModel
+      : null;
+  const shapedRaw = constrainLaneShape(raw, learned);
   const difference = previous
-    ? (averagePointDifference(raw.left.points, previous.left.points) +
-        averagePointDifference(raw.right.points, previous.right.points)) /
+    ? (averagePointDifference(
+        shapedRaw.left.points,
+        previous.left.points,
+      ) +
+        averagePointDifference(
+          shapedRaw.right.points,
+          previous.right.points,
+        )) /
       2
     : 1;
   const consistent =
     previous &&
     difference <= 0.085 &&
-    Math.abs(previous.bottomY - raw.bottomY) <= 0.075;
+    Math.abs(previous.bottomY - shapedRaw.bottomY) <= 0.075;
   if (
     previous &&
     !consistent &&
     tracker.laneEvidence >= 2 &&
     tracker.laneMisses < 3 &&
-    raw.confidence < previous.confidence + 0.18
+    shapedRaw.confidence < previous.confidence + 0.18
   ) {
     tracker.laneMisses += 1;
+    tracker.laneModelOutliers += 1;
+    tracker.laneModelEvidence = Math.max(
+      0,
+      tracker.laneModelEvidence - 1,
+    );
     tracker.lane = {
       ...previous,
       confidence: previous.confidence * 0.94,
@@ -1149,19 +1400,16 @@ function stabilizeLane(
   tracker.laneEvidence = consistent
     ? Math.min(6, tracker.laneEvidence + 1)
     : 1;
-  tracker.lane = consistent
-    ? {
-        left: {
-          points: blendPoints(raw.left.points, previous.left.points, 0.68),
-        },
-        right: {
-          points: blendPoints(raw.right.points, previous.right.points, 0.68),
-        },
-        topY: interpolate(previous.topY, raw.topY, 0.68),
-        bottomY: interpolate(previous.bottomY, raw.bottomY, 0.68),
-        confidence: interpolate(previous.confidence, raw.confidence, 0.58),
-      }
-    : raw;
+  const resetModel =
+    !previous || tracker.laneModelOutliers >= 3;
+  learnLaneShape(shapedRaw, tracker, resetModel);
+  const nextLane = consistent
+    ? blendLanes(shapedRaw, previous, 0.58)
+    : shapedRaw;
+  tracker.lane = constrainLaneShape(
+    nextLane,
+    tracker.laneModelEvidence >= 2 ? tracker.laneModel : null,
+  );
   return tracker.laneEvidence >= 2 ? tracker.lane : null;
 }
 
@@ -1181,6 +1429,9 @@ export function analyzeRoadScene(
     tracker.dashboard = null;
     tracker.laneEvidence = 0;
     tracker.laneMisses = 0;
+    tracker.laneModel = null;
+    tracker.laneModelEvidence = 0;
+    tracker.laneModelOutliers = 0;
     tracker.dashboardEvidence = 0;
     return emptyRoadScene(analyzedAt);
   }
@@ -1194,13 +1445,17 @@ export function analyzeRoadScene(
   tracker.scratchLuminance = luminance;
   const rawDashboard = detectDashboard(luminance, width, height);
   const dashboard = stabilizeDashboard(rawDashboard, tracker);
+  const lanePrior =
+    tracker.laneModel && tracker.laneModelEvidence >= 2
+      ? tracker.laneModel
+      : tracker.lane;
   const rawLane = detectLane(
     pixels,
     luminance,
     width,
     height,
     rawDashboard ?? dashboard,
-    tracker.lane,
+    lanePrior,
   );
   const lane = stabilizeLane(rawLane, tracker);
   return { lane, dashboard, analyzedAt };
