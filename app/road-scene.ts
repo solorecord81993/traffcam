@@ -30,6 +30,7 @@ export type RoadScene = {
 export type RoadSceneTracker = {
   lane: DetectedLane | null;
   laneEvidence: number;
+  laneMisses: number;
   dashboard: DashboardMask | null;
   dashboardEvidence: number;
   scratchPixels: Uint8ClampedArray | null;
@@ -41,17 +42,23 @@ type EdgePoint = {
   y: number;
   weight: number;
   paint: number;
+  white: number;
+  yellow: number;
 };
+
+type LanePaintType = "white" | "yellow";
 
 type FittedLine = {
   slope: number;
   intercept: number;
   confidence: number;
   support: EdgePoint[];
+  paintType: LanePaintType;
 };
 
 type TracedBoundary = {
   points: NormalizedPoint[];
+  observed: boolean[];
   confidence: number;
   observedRatio: number;
 };
@@ -78,11 +85,75 @@ export function createRoadSceneTracker(): RoadSceneTracker {
   return {
     lane: null,
     laneEvidence: 0,
+    laneMisses: 0,
     dashboard: null,
     dashboardEvidence: 0,
     scratchPixels: null,
     scratchLuminance: null,
   };
+}
+
+function paintScoresAt(
+  pixels: Uint8ClampedArray,
+  luminance: Float32Array,
+  width: number,
+  height: number,
+  x: number,
+  y: number,
+) {
+  const leftX = Math.max(0, x - 7);
+  const rightX = Math.min(width - 1, x + 7);
+  const upperY = Math.max(0, y - 4);
+  const lowerY = Math.min(height - 1, y + 4);
+  const background =
+    (luminance[y * width + leftX] +
+      luminance[y * width + rightX] +
+      luminance[upperY * width + x] +
+      luminance[lowerY * width + x]) /
+    4;
+  let white = 0;
+  let yellow = 0;
+
+  // An edge sample can land on either side of a painted stripe. Inspect a
+  // narrow cross-section and keep the most paint-like pixel near the edge.
+  for (let offset = -2; offset <= 2; offset += 1) {
+    const sampleX = clamp(x + offset, 0, width - 1);
+    const center = y * width + sampleX;
+    const pixelIndex = center * 4;
+    const red = pixels[pixelIndex];
+    const green = pixels[pixelIndex + 1];
+    const blue = pixels[pixelIndex + 2];
+    const maximum = Math.max(red, green, blue);
+    const minimum = Math.min(red, green, blue);
+    const chroma = maximum - minimum;
+    const brightness = luminance[center];
+    const contrast = brightness - background;
+
+    const neutral = 1 - clamp((chroma - 12) / 78, 0, 1);
+    const whiteBrightness = clamp((brightness - 88) / 112, 0, 1);
+    const whiteContrast = clamp((contrast - 4) / 42, 0, 1);
+    white = Math.max(
+      white,
+      neutral *
+        whiteBrightness *
+        (0.28 + whiteContrast * 0.72),
+    );
+
+    const warmSeparation = Math.min(red, green) - blue;
+    const yellowHue =
+      clamp((warmSeparation - 5) / 72, 0, 1) *
+      clamp((green - red * 0.46) / 64, 0, 1);
+    const yellowBrightness = clamp((brightness - 58) / 125, 0, 1);
+    const yellowContrast = clamp((contrast - 2) / 38, 0, 1);
+    yellow = Math.max(
+      yellow,
+      yellowHue *
+        yellowBrightness *
+        (0.32 + yellowContrast * 0.68),
+    );
+  }
+
+  return { white, yellow, paint: Math.max(white, yellow) };
 }
 
 export function emptyRoadScene(analyzedAt = 0): RoadScene {
@@ -290,39 +361,41 @@ function collectLaneEdges(
         luminance[center + width] * 2 +
         luminance[center + width + 1];
       const magnitude = Math.hypot(gx, gy);
-      if (magnitude < 54 || Math.abs(gx) < Math.abs(gy) * 0.16) continue;
+      if (magnitude < 48 || Math.abs(gx) < Math.abs(gy) * 0.14) continue;
 
-      const pixelIndex = center * 4;
-      const red = pixels[pixelIndex];
-      const green = pixels[pixelIndex + 1];
-      const blue = pixels[pixelIndex + 2];
-      const maximum = Math.max(red, green, blue);
-      const minimum = Math.min(red, green, blue);
-      const white =
-        luminance[center] >= 138 && maximum - minimum <= 58;
-      const yellow =
-        red >= 118 &&
-        green >= 92 &&
-        blue <= Math.min(red, green) * 0.82;
-      const paint = white || yellow ? 1 : 0;
+      const scores = paintScoresAt(
+        pixels,
+        luminance,
+        width,
+        height,
+        x,
+        y,
+      );
+      // Only painted white/yellow candidates enter the lane tracker. A
+      // dashed gap is extrapolated from the lane path instead of being
+      // filled with an unrelated vehicle, barrier, shadow, or asphalt edge.
+      if (scores.paint < 0.16) continue;
       points.push({
         x: x / width,
         y: normalizedY,
         weight:
-          clamp(magnitude / 110, 0.55, 3.2) * (paint ? 1.65 : 1),
-        paint,
+          clamp(magnitude / 125, 0.45, 3) *
+          (0.38 + scores.paint * 1.62),
+        paint: scores.paint,
+        white: scores.white,
+        yellow: scores.yellow,
       });
     }
   }
   return points;
 }
 
-function fitLaneLine(
+function fitLaneLines(
   points: EdgePoint[],
   side: "left" | "right",
   topY: number,
   bottomY: number,
-): FittedLine | null {
+): FittedLine[] {
   const slopeCount = 35;
   const interceptMinimum = -1.45;
   const interceptMaximum = 2.45;
@@ -356,100 +429,175 @@ function fitLaneLine(
     }
   }
 
-  let bestIndex = -1;
-  let bestVotes = 0;
+  const ranked: Array<{
+    slopeIndex: number;
+    interceptIndex: number;
+    score: number;
+  }> = [];
   for (let index = 0; index < accumulator.length; index += 1) {
-    if (accumulator[index] > bestVotes) {
-      bestVotes = accumulator[index];
-      bestIndex = index;
-    }
+    const votes = accumulator[index];
+    if (votes < 6) continue;
+    const slopeIndex = Math.floor(index / interceptBins);
+    const interceptIndex = index % interceptBins;
+    const slope =
+      interpolate(0.075, 1.38, slopeIndex / (slopeCount - 1)) * sign;
+    const intercept =
+      interceptMinimum +
+      ((interceptIndex + 0.5) / interceptBins) *
+        (interceptMaximum - interceptMinimum);
+    const bottomX = slope * bottomY + intercept;
+    const centerDistance =
+      side === "left" ? 0.5 - bottomX : bottomX - 0.5;
+    if (centerDistance < 0.035 || centerDistance > 0.72) continue;
+    // The current lane is bounded by the first reliable marking on either
+    // side of the camera center. This preference stops a large white car or
+    // a farther adjacent-lane stripe from winning purely on pixel count.
+    const centerPreference =
+      1 / Math.pow(centerDistance + 0.065, 2);
+    ranked.push({
+      slopeIndex,
+      interceptIndex,
+      score: votes * centerPreference,
+    });
   }
-  if (bestIndex < 0 || bestVotes < 10) return null;
-
-  const slopeIndex = Math.floor(bestIndex / interceptBins);
-  const interceptIndex = bestIndex % interceptBins;
-  let slope =
-    interpolate(0.075, 1.38, slopeIndex / (slopeCount - 1)) * sign;
-  let intercept =
-    interceptMinimum +
-    ((interceptIndex + 0.5) / interceptBins) *
-      (interceptMaximum - interceptMinimum);
-  let support = points.filter((point) => {
-    if (
-      (side === "left" && point.x > 0.66) ||
-      (side === "right" && point.x < 0.34)
-    ) {
-      return false;
-    }
-    return Math.abs(point.x - (slope * point.y + intercept)) <= 0.022;
-  });
-  if (support.length < 7) return null;
-
-  let totalWeight = 0;
-  let sumY = 0;
-  let sumX = 0;
-  let sumYY = 0;
-  let sumYX = 0;
-  for (const point of support) {
-    totalWeight += point.weight;
-    sumY += point.y * point.weight;
-    sumX += point.x * point.weight;
-    sumYY += point.y * point.y * point.weight;
-    sumYX += point.y * point.x * point.weight;
-  }
-  const denominator = totalWeight * sumYY - sumY * sumY;
-  if (Math.abs(denominator) < 0.00001) return null;
-  slope = (totalWeight * sumYX - sumY * sumX) / denominator;
-  intercept = (sumX - slope * sumY) / totalWeight;
-
-  if (
-    (side === "left" && (slope >= -0.055 || slope < -1.55)) ||
-    (side === "right" && (slope <= 0.055 || slope > 1.55))
-  ) {
-    return null;
-  }
-
-  support = points.filter(
-    (point) =>
-      Math.abs(point.x - (slope * point.y + intercept)) <= 0.024,
-  );
-  if (support.length < 7) return null;
-
-  const coveredBands = new Set<number>();
-  let residualTotal = 0;
-  let weightedSupport = 0;
-  let paintSupport = 0;
-  for (const point of support) {
-    coveredBands.add(
-      clamp(
-        Math.floor(
-          ((point.y - topY) / Math.max(0.01, bottomY - topY)) * 12,
-        ),
-        0,
-        11,
-      ),
+  ranked.sort((first, second) => second.score - first.score);
+  const candidates: typeof ranked = [];
+  for (const candidate of ranked) {
+    const duplicate = candidates.some(
+      (chosen) =>
+        Math.abs(chosen.slopeIndex - candidate.slopeIndex) <= 2 &&
+        Math.abs(chosen.interceptIndex - candidate.interceptIndex) <= 4,
     );
-    residualTotal +=
-      Math.abs(point.x - (slope * point.y + intercept)) * point.weight;
-    weightedSupport += point.weight;
-    paintSupport += point.paint * point.weight;
+    if (!duplicate) candidates.push(candidate);
+    if (candidates.length >= 18) break;
   }
-  const coverage = coveredBands.size / 12;
-  const residual = residualTotal / Math.max(1, weightedSupport);
-  const paintRatio = paintSupport / Math.max(1, weightedSupport);
-  const confidence = clamp(
-    (coverage - 0.16) * 1.45 +
-      clamp((weightedSupport - 15) / 95, 0, 0.35) +
-      clamp((0.024 - residual) / 0.024, 0, 0.25) +
-      paintRatio * 0.2,
-    0,
-    1,
-  );
-  if (coverage < 0.18 || residual > 0.024 || confidence < 0.29) {
-    return null;
+  const fitted: FittedLine[] = [];
+
+  for (const candidate of candidates) {
+    let slope =
+      interpolate(
+        0.075,
+        1.38,
+        candidate.slopeIndex / (slopeCount - 1),
+      ) * sign;
+    let intercept =
+      interceptMinimum +
+      ((candidate.interceptIndex + 0.5) / interceptBins) *
+        (interceptMaximum - interceptMinimum);
+    let support = points.filter((point) => {
+      if (
+        (side === "left" && point.x > 0.66) ||
+        (side === "right" && point.x < 0.34)
+      ) {
+        return false;
+      }
+      return Math.abs(point.x - (slope * point.y + intercept)) <= 0.022;
+    });
+    if (support.length < 7) continue;
+
+    let totalWeight = 0;
+    let sumY = 0;
+    let sumX = 0;
+    let sumYY = 0;
+    let sumYX = 0;
+    for (const point of support) {
+      totalWeight += point.weight;
+      sumY += point.y * point.weight;
+      sumX += point.x * point.weight;
+      sumYY += point.y * point.y * point.weight;
+      sumYX += point.y * point.x * point.weight;
+    }
+    const denominator = totalWeight * sumYY - sumY * sumY;
+    if (Math.abs(denominator) < 0.00001) continue;
+    slope = (totalWeight * sumYX - sumY * sumX) / denominator;
+    intercept = (sumX - slope * sumY) / totalWeight;
+
+    if (
+      (side === "left" && (slope >= -0.055 || slope < -1.55)) ||
+      (side === "right" && (slope <= 0.055 || slope > 1.55))
+    ) {
+      continue;
+    }
+    const refinedBottomX = slope * bottomY + intercept;
+    const refinedDistance =
+      side === "left"
+        ? 0.5 - refinedBottomX
+        : refinedBottomX - 0.5;
+    if (refinedDistance < 0.035 || refinedDistance > 0.72) continue;
+
+    support = points.filter(
+      (point) =>
+        Math.abs(point.x - (slope * point.y + intercept)) <= 0.024,
+    );
+    if (support.length < 7) continue;
+    let minimumSupportY = 1;
+    let maximumSupportY = 0;
+    for (const point of support) {
+      minimumSupportY = Math.min(minimumSupportY, point.y);
+      maximumSupportY = Math.max(maximumSupportY, point.y);
+    }
+    const roiHeight = bottomY - topY;
+    if (
+      maximumSupportY - minimumSupportY < roiHeight * 0.44 ||
+      maximumSupportY < topY + roiHeight * 0.74
+    ) {
+      continue;
+    }
+
+    const coveredBands = new Set<number>();
+    let residualTotal = 0;
+    let weightedSupport = 0;
+    let paintSupport = 0;
+    let whiteSupport = 0;
+    let yellowSupport = 0;
+    for (const point of support) {
+      coveredBands.add(
+        clamp(
+          Math.floor(
+            ((point.y - topY) / Math.max(0.01, bottomY - topY)) * 12,
+          ),
+          0,
+          11,
+        ),
+      );
+      residualTotal +=
+        Math.abs(point.x - (slope * point.y + intercept)) * point.weight;
+      weightedSupport += point.weight;
+      paintSupport += point.paint * point.weight;
+      whiteSupport += point.white * point.weight;
+      yellowSupport += point.yellow * point.weight;
+    }
+    const coverage = coveredBands.size / 12;
+    const residual = residualTotal / Math.max(1, weightedSupport);
+    const paintRatio = paintSupport / Math.max(1, weightedSupport);
+    const confidence = clamp(
+      (coverage - 0.16) * 1.45 +
+        clamp((weightedSupport - 15) / 95, 0, 0.35) +
+        clamp((0.024 - residual) / 0.024, 0, 0.25) +
+        paintRatio * 0.2,
+      0,
+      1,
+    );
+    if (
+      coverage < 0.25 ||
+      paintRatio < 0.2 ||
+      residual > 0.024 ||
+      confidence < 0.29
+    ) {
+      continue;
+    }
+
+    fitted.push({
+      slope,
+      intercept,
+      confidence,
+      support,
+      paintType: yellowSupport > whiteSupport ? "yellow" : "white",
+    });
+    if (fitted.length >= 8) break;
   }
 
-  return { slope, intercept, confidence, support };
+  return fitted;
 }
 
 function traceBoundaryFromImage(
@@ -458,6 +606,7 @@ function traceBoundaryFromImage(
   side: "left" | "right",
   topY: number,
   bottomY: number,
+  previous: LaneBoundary | null,
 ): TracedBoundary {
   // The straight Hough line is only a coarse starting point. From there,
   // follow the strongest connected edge band-by-band from the foreground
@@ -465,6 +614,7 @@ function traceBoundaryFromImage(
   // the seed. This preserves real curves instead of drawing the seed line.
   const samples = 13;
   const traced = new Array<NormalizedPoint>(samples);
+  const observed = new Array<boolean>(samples).fill(false);
   let observedBands = 0;
   let paintedBands = 0;
   let previousOffset = 0;
@@ -474,17 +624,27 @@ function traceBoundaryFromImage(
     const progress = index / (samples - 1);
     const y = interpolate(topY, bottomY, progress);
     const seedX = seed.slope * y + seed.intercept;
+    const previousX = previous
+      ? interpolateAtAxis(previous.points, y, "y")
+      : seedX;
+    const referenceX = previous
+      ? interpolate(seedX, previousX, 0.62)
+      : seedX;
     const predictedOffset = previousOffset + offsetVelocity * 0.62;
-    const predictedX = seedX + predictedOffset;
+    const predictedX = referenceX + predictedOffset;
     const yRadius = interpolate(0.026, 0.044, progress);
-    const searchRadius = interpolate(0.065, 0.145, progress);
+    const searchRadius = interpolate(0.052, 0.098, progress);
     const clusterRadius = interpolate(0.014, 0.027, progress);
     const candidates = allEdges.filter((point) => {
       if (Math.abs(point.y - y) > yRadius) return false;
       if (Math.abs(point.x - predictedX) > searchRadius) return false;
       if (side === "left" && point.x > 0.69) return false;
       if (side === "right" && point.x < 0.31) return false;
-      return true;
+      const colorScore =
+        seed.paintType === "yellow"
+          ? Math.max(point.yellow, point.white * 0.42)
+          : Math.max(point.white, point.yellow * 0.42);
+      return colorScore >= 0.12;
     });
 
     let observedX: number | null = null;
@@ -506,9 +666,13 @@ function traceBoundaryFromImage(
           1 -
           Math.abs(point.x - predictedX) /
             Math.max(0.001, searchRadius);
+        const colorScore =
+          seed.paintType === "yellow"
+            ? Math.max(point.yellow, point.white * 0.42)
+            : Math.max(point.white, point.yellow * 0.42);
         densityBins[bin] +=
           point.weight *
-          (point.paint ? 1.3 : 0.82) *
+          (0.35 + colorScore * 1.65) *
           Math.max(0.12, verticalProximity) *
           Math.max(0.16, predictionProximity);
       }
@@ -552,13 +716,14 @@ function traceBoundaryFromImage(
     let nextOffset = predictedOffset;
     if (observedX !== null) {
       observedBands += 1;
+      observed[index] = true;
       if (observedPaint >= 0.34) paintedBands += 1;
       const measuredOffset = clamp(
-        observedX - seedX,
+        observedX - referenceX,
         -searchRadius,
         searchRadius,
       );
-      const observationWeight = observedPaint >= 0.34 ? 0.82 : 0.68;
+      const observationWeight = observedPaint >= 0.34 ? 0.72 : 0.56;
       nextOffset = interpolate(
         predictedOffset,
         measuredOffset,
@@ -567,13 +732,13 @@ function traceBoundaryFromImage(
     } else {
       // Missing paint or a dashed line can create a short gap. Continue the
       // local curve through the gap, but gently return towards the seed.
-      nextOffset *= 0.86;
+      nextOffset = predictedOffset * 0.96;
     }
 
-    offsetVelocity = clamp(nextOffset - previousOffset, -0.055, 0.055);
+    offsetVelocity = clamp(nextOffset - previousOffset, -0.028, 0.028);
     previousOffset = nextOffset;
     traced[index] = {
-      x: clamp(seedX + nextOffset, -0.06, 1.06),
+      x: clamp(referenceX + nextOffset, -0.06, 1.06),
       y,
     };
   }
@@ -599,7 +764,158 @@ function traceBoundaryFromImage(
     0,
     1,
   );
-  return { points, confidence, observedRatio };
+  return { points, observed, confidence, observedRatio };
+}
+
+function regularizeLanePair(
+  left: TracedBoundary,
+  right: TracedBoundary,
+  leftSeed: FittedLine,
+  rightSeed: FittedLine,
+  previous: DetectedLane | null,
+) {
+  const leftPoints: NormalizedPoint[] = [];
+  const rightPoints: NormalizedPoint[] = [];
+
+  for (let index = 0; index < left.points.length; index += 1) {
+    const y = left.points[index].y;
+    const progress = index / Math.max(1, left.points.length - 1);
+    const seedLeft = leftSeed.slope * y + leftSeed.intercept;
+    const seedRight = rightSeed.slope * y + rightSeed.intercept;
+    const seedCenter = (seedLeft + seedRight) / 2;
+    const seedWidth = Math.max(0.024, seedRight - seedLeft);
+    const previousBounds = previous ? laneBoundsAt(previous, y) : null;
+    const expectedCenter = previousBounds
+      ? interpolate(
+          seedCenter,
+          (previousBounds.left + previousBounds.right) / 2,
+          0.68,
+        )
+      : seedCenter;
+    const expectedWidth = previousBounds
+      ? interpolate(
+          seedWidth,
+          previousBounds.right - previousBounds.left,
+          0.68,
+        )
+      : seedWidth;
+    const leftObserved = left.observed[index];
+    const rightObserved = right.observed[index];
+    let center = expectedCenter;
+    let widthAtBand = expectedWidth;
+
+    if (leftObserved && rightObserved) {
+      const measuredCenter =
+        (left.points[index].x + right.points[index].x) / 2;
+      const measuredWidth =
+        right.points[index].x - left.points[index].x;
+      const centerTolerance = interpolate(0.045, 0.085, progress);
+      center = clamp(
+        measuredCenter,
+        expectedCenter - centerTolerance,
+        expectedCenter + centerTolerance,
+      );
+      widthAtBand = clamp(
+        measuredWidth,
+        Math.max(0.02, expectedWidth * 0.84),
+        expectedWidth * 1.18,
+      );
+    } else if (leftObserved) {
+      const measuredCenter = left.points[index].x + expectedWidth / 2;
+      center = interpolate(expectedCenter, measuredCenter, 0.7);
+    } else if (rightObserved) {
+      const measuredCenter = right.points[index].x - expectedWidth / 2;
+      center = interpolate(expectedCenter, measuredCenter, 0.7);
+    }
+
+    leftPoints.push({ x: center - widthAtBand / 2, y });
+    rightPoints.push({ x: center + widthAtBand / 2, y });
+  }
+
+  return {
+    left: { ...left, points: leftPoints },
+    right: { ...right, points: rightPoints },
+  };
+}
+
+function chooseLanePair(
+  leftCandidates: FittedLine[],
+  rightCandidates: FittedLine[],
+  roadBottom: number,
+  previous: DetectedLane | null,
+) {
+  let best:
+    | {
+        left: FittedLine;
+        right: FittedLine;
+        vanishX: number;
+        vanishY: number;
+        topY: number;
+        score: number;
+      }
+    | null = null;
+
+  for (const left of leftCandidates) {
+    for (const right of rightCandidates) {
+      const denominator = left.slope - right.slope;
+      if (Math.abs(denominator) < 0.12) continue;
+      const vanishY = (right.intercept - left.intercept) / denominator;
+      const vanishX = left.slope * vanishY + left.intercept;
+      if (
+        vanishY < 0.16 ||
+        vanishY > 0.6 ||
+        vanishX < 0.2 ||
+        vanishX > 0.8
+      ) {
+        continue;
+      }
+
+      const topY = clamp(
+        vanishY + 0.055,
+        0.35,
+        Math.min(0.62, roadBottom - 0.22),
+      );
+      if (topY <= vanishY + 0.015) continue;
+      const leftTop = left.slope * topY + left.intercept;
+      const rightTop = right.slope * topY + right.intercept;
+      const leftBottom = left.slope * roadBottom + left.intercept;
+      const rightBottom = right.slope * roadBottom + right.intercept;
+      const topWidth = rightTop - leftTop;
+      const bottomWidth = rightBottom - leftBottom;
+      const bottomCenter = (leftBottom + rightBottom) / 2;
+      if (
+        topWidth < 0.018 ||
+        bottomWidth < 0.2 ||
+        bottomWidth > 1.04 ||
+        bottomCenter < 0.2 ||
+        bottomCenter > 0.8 ||
+        leftBottom >= 0.5 ||
+        rightBottom <= 0.5
+      ) {
+        continue;
+      }
+
+      const leftDistance = 0.5 - leftBottom;
+      const rightDistance = rightBottom - 0.5;
+      let score =
+        (left.confidence + right.confidence) * 0.75 +
+        clamp((0.92 - bottomWidth) / 0.72, 0, 1) * 0.72 +
+        clamp(1 - Math.abs(vanishX - 0.5) * 2.2, 0, 1) * 0.32 -
+        Math.abs(leftDistance - rightDistance) * 0.35;
+      if (previous) {
+        const previousBounds = laneBoundsAt(previous, roadBottom);
+        const previousWidth = previousBounds.right - previousBounds.left;
+        const previousCenter =
+          (previousBounds.left + previousBounds.right) / 2;
+        score -= Math.abs(previousWidth - bottomWidth) * 1.25;
+        score -= Math.abs(previousCenter - bottomCenter) * 1.55;
+      }
+      if (!best || score > best.score) {
+        best = { left, right, vanishX, vanishY, topY, score };
+      }
+    }
+  }
+  return best;
 }
 
 function detectLane(
@@ -608,6 +924,7 @@ function detectLane(
   width: number,
   height: number,
   dashboard: DashboardMask | null,
+  previous: DetectedLane | null,
 ): DetectedLane | null {
   const roiTop = 0.3;
   const roadBottom = clamp(
@@ -626,34 +943,21 @@ function detectLane(
     roadBottom,
   );
   if (edgePoints.length < 28) return null;
-  const left = fitLaneLine(edgePoints, "left", roiTop, roadBottom);
-  const right = fitLaneLine(edgePoints, "right", roiTop, roadBottom);
-  if (!left || !right) return null;
-
-  const denominator = left.slope - right.slope;
-  if (Math.abs(denominator) < 0.12) return null;
-  const vanishY = (right.intercept - left.intercept) / denominator;
-  const vanishX = left.slope * vanishY + left.intercept;
-  if (
-    vanishY < 0.16 ||
-    vanishY > 0.72 ||
-    vanishX < 0.16 ||
-    vanishX > 0.84
-  ) {
-    return null;
-  }
-
-  const topY = clamp(
-    vanishY + 0.055,
-    0.35,
-    Math.min(0.62, roadBottom - 0.22),
+  const pair = chooseLanePair(
+    fitLaneLines(edgePoints, "left", roiTop, roadBottom),
+    fitLaneLines(edgePoints, "right", roiTop, roadBottom),
+    roadBottom,
+    previous,
   );
+  if (!pair) return null;
+  const { left, right, vanishX, topY } = pair;
   const leftTrace = traceBoundaryFromImage(
     edgePoints,
     left,
     "left",
     topY,
     roadBottom,
+    previous?.left ?? null,
   );
   const rightTrace = traceBoundaryFromImage(
     edgePoints,
@@ -661,6 +965,7 @@ function detectLane(
     "right",
     topY,
     roadBottom,
+    previous?.right ?? null,
   );
   if (
     leftTrace.observedRatio < 0.38 ||
@@ -669,16 +974,28 @@ function detectLane(
     return null;
   }
 
-  const leftTop = leftTrace.points[0].x;
-  const rightTop = rightTrace.points[0].x;
-  const leftBottom = leftTrace.points[leftTrace.points.length - 1].x;
-  const rightBottom = rightTrace.points[rightTrace.points.length - 1].x;
+  const regularized = regularizeLanePair(
+    leftTrace,
+    rightTrace,
+    left,
+    right,
+    previous,
+  );
+  const stableLeftTrace = regularized.left;
+  const stableRightTrace = regularized.right;
+
+  const leftTop = stableLeftTrace.points[0].x;
+  const rightTop = stableRightTrace.points[0].x;
+  const leftBottom =
+    stableLeftTrace.points[stableLeftTrace.points.length - 1].x;
+  const rightBottom =
+    stableRightTrace.points[stableRightTrace.points.length - 1].x;
   const topWidth = rightTop - leftTop;
   const bottomWidth = rightBottom - leftBottom;
   const bottomCenter = (leftBottom + rightBottom) / 2;
 
   if (
-    topWidth < 0.025 ||
+    topWidth < 0.018 ||
     topWidth > 0.44 ||
     bottomWidth < 0.2 ||
     bottomWidth > 1.04 ||
@@ -699,8 +1016,8 @@ function detectLane(
   );
   if (perspectiveGrowth < 1.18 || geometryConfidence < 0.38) return null;
 
-  const widths = leftTrace.points.map(
-    (point, index) => rightTrace.points[index].x - point.x,
+  const widths = stableLeftTrace.points.map(
+    (point, index) => stableRightTrace.points[index].x - point.x,
   );
   if (widths.some((widthAtBand) => widthAtBand <= 0.018)) return null;
   let severeNarrowing = 0;
@@ -710,15 +1027,16 @@ function detectLane(
   if (severeNarrowing > 2) return null;
 
   const confidence = clamp(
-    Math.min(leftTrace.confidence, rightTrace.confidence) * 0.72 +
+    Math.min(stableLeftTrace.confidence, stableRightTrace.confidence) *
+      0.72 +
       geometryConfidence * 0.28,
     0,
     1,
   );
   if (confidence < 0.34) return null;
   return {
-    left: { points: leftTrace.points },
-    right: { points: rightTrace.points },
+    left: { points: stableLeftTrace.points },
+    right: { points: stableRightTrace.points },
     topY,
     bottomY: roadBottom,
     confidence,
@@ -788,6 +1106,15 @@ function stabilizeLane(
   tracker: RoadSceneTracker,
 ) {
   if (!raw) {
+    tracker.laneMisses += 1;
+    tracker.laneEvidence = Math.max(0, tracker.laneEvidence - 1);
+    if (tracker.lane && tracker.laneMisses <= 3) {
+      tracker.lane = {
+        ...tracker.lane,
+        confidence: tracker.lane.confidence * 0.92,
+      };
+      return tracker.lane;
+    }
     tracker.lane = null;
     tracker.laneEvidence = 0;
     return null;
@@ -801,8 +1128,24 @@ function stabilizeLane(
     : 1;
   const consistent =
     previous &&
-    difference <= 0.105 &&
+    difference <= 0.085 &&
     Math.abs(previous.bottomY - raw.bottomY) <= 0.075;
+  if (
+    previous &&
+    !consistent &&
+    tracker.laneEvidence >= 2 &&
+    tracker.laneMisses < 3 &&
+    raw.confidence < previous.confidence + 0.18
+  ) {
+    tracker.laneMisses += 1;
+    tracker.lane = {
+      ...previous,
+      confidence: previous.confidence * 0.94,
+    };
+    return tracker.lane;
+  }
+
+  tracker.laneMisses = 0;
   tracker.laneEvidence = consistent
     ? Math.min(6, tracker.laneEvidence + 1)
     : 1;
@@ -837,6 +1180,7 @@ export function analyzeRoadScene(
     tracker.lane = null;
     tracker.dashboard = null;
     tracker.laneEvidence = 0;
+    tracker.laneMisses = 0;
     tracker.dashboardEvidence = 0;
     return emptyRoadScene(analyzedAt);
   }
@@ -856,6 +1200,7 @@ export function analyzeRoadScene(
     width,
     height,
     rawDashboard ?? dashboard,
+    tracker.lane,
   );
   const lane = stabilizeLane(rawLane, tracker);
   return { lane, dashboard, analyzedAt };
