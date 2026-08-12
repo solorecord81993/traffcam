@@ -2,22 +2,30 @@
 
 import {
   AlertTriangle,
+  ArrowLeft,
   Bike,
   Camera,
   CarFront,
+  Check,
+  Copy,
   Footprints,
   Gauge,
   Info,
   LoaderCircle,
   Maximize2,
+  Monitor,
   Navigation,
+  Radio,
   RefreshCw,
   Settings2,
   ShieldCheck,
+  Users,
   Volume2,
   VolumeX,
+  Wifi,
   X,
 } from "lucide-react";
+import type { DataConnection, MediaConnection, Peer } from "peerjs";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   deriveMotion,
@@ -32,6 +40,17 @@ import {
   emptyRoadScene,
   type RoadScene,
 } from "./road-scene";
+import {
+  cleanRoomCode,
+  createRoomCode,
+  isCameraControl,
+  isCameraTelemetry,
+  ROOM_CODE_LENGTH,
+  roomPeerId,
+  type CameraControl,
+  type CameraTelemetry,
+  type FrameRateTarget,
+} from "./p2p";
 import {
   analyzeDetections,
   renderVisionOverlay,
@@ -50,7 +69,8 @@ type CameraState =
   | "running"
   | "error";
 type ModelState = "idle" | "loading" | "ready" | "error";
-type FrameRateTarget = 30 | 45 | 60;
+type AppRole = "camera" | "monitor";
+type RoomState = "idle" | "connecting" | "ready" | "error";
 type GpsState =
   | "idle"
   | "locating"
@@ -474,6 +494,401 @@ async function resetCameraZoom(track: MediaStreamTrack) {
   }
 }
 
+function gpsReading(state: GpsState, speedKmh: number) {
+  return state === "ready"
+    ? `${speedKmh} กม./ชม.`
+    : state === "locating"
+      ? "กำลังหา GPS"
+      : state === "denied"
+        ? "GPS ถูกปิด"
+        : state === "unsupported"
+          ? "ไม่รองรับ GPS"
+          : "สัญญาณ GPS อ่อน";
+}
+
+function peerErrorMessage(error: unknown) {
+  const type = peerErrorType(error);
+  if (type === "peer-unavailable") {
+    return "ไม่พบห้องนี้ ตรวจรหัสและให้เครื่องกล้องเปิดหน้านี้ค้างไว้";
+  }
+  if (type === "unavailable-id") {
+    return "รหัสห้องนี้ถูกใช้อยู่แล้ว กรุณาสุ่มรหัสใหม่";
+  }
+  if (type === "network" || type === "server-error" || type === "socket-error") {
+    return "เชื่อมต่อระบบจับคู่ไม่ได้ ตรวจอินเทอร์เน็ตของเครื่องที่เปิด hotspot";
+  }
+  return "การเชื่อมต่อขาดหาย กรุณาลองใหม่";
+}
+
+function peerErrorType(error: unknown) {
+  return (
+    error && typeof error === "object" && "type" in error
+      ? String(error.type)
+      : ""
+  );
+}
+
+function RoleLanding({
+  onChoose,
+}: {
+  onChoose: (role: AppRole) => void;
+}) {
+  return (
+    <main className="app-shell role-shell">
+      <div className="ambient" aria-hidden="true">
+        <div className="ambient-orb ambient-orb-one" />
+        <div className="ambient-orb ambient-orb-two" />
+        <div className="road-grid" />
+      </div>
+      <header className="top-bar">
+        <div className="brand">
+          <span className="brand-mark">
+            <ShieldCheck size={20} strokeWidth={2.4} />
+          </span>
+          <span>
+            <strong>RoadGuard</strong>
+            <small>P2P ROAD AWARENESS</small>
+          </span>
+        </div>
+        <div className="privacy-pill">
+          <Radio size={13} /> P2P
+        </div>
+      </header>
+
+      <section className="role-panel">
+        <div className="eyebrow">
+          <span className="eyebrow-dot" />
+          เลือกหน้าที่ของเครื่องนี้
+        </div>
+        <h1>
+          มองถนนจาก
+          <br />
+          <span>อีกหน้าจอ</span>
+        </h1>
+        <p className="lead">
+          เครื่องกล้องประมวลผล AI ส่วนเครื่อง Monitor ดูภาพ ผลตรวจจับ
+          และปรับค่าได้แบบ P2P ผ่าน hotspot
+        </p>
+
+        <div className="role-options">
+          <button type="button" onClick={() => onChoose("camera")}>
+            <span className="role-icon camera-role-icon">
+              <Camera size={29} />
+            </span>
+            <span>
+              <strong>เครื่องกล้อง</strong>
+              <small>เปิดกล้อง GPS และ AI พร้อมสร้างรหัสห้อง</small>
+            </span>
+            <span className="role-arrow">→</span>
+          </button>
+          <button type="button" onClick={() => onChoose("monitor")}>
+            <span className="role-icon monitor-role-icon">
+              <Monitor size={29} />
+            </span>
+            <span>
+              <strong>เครื่อง Monitor</strong>
+              <small>กรอกรหัสเพื่อดูภาพและควบคุมค่าจากอีกเครื่อง</small>
+            </span>
+            <span className="role-arrow">→</span>
+          </button>
+        </div>
+
+        <div className="hotspot-note">
+          <Wifi size={17} />
+          <span>
+            ต่อทุกเครื่องเข้ากับ hotspot เดียวกัน และเปิดอินเทอร์เน็ตไว้เฉพาะตอนจับคู่
+          </span>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function MonitorView({ onBack }: { onBack: () => void }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const peerRef = useRef<Peer | null>(null);
+  const connectionRef = useRef<DataConnection | null>(null);
+  const callRef = useRef<MediaConnection | null>(null);
+  const [roomCode, setRoomCode] = useState("");
+  const [roomState, setRoomState] = useState<RoomState>("idle");
+  const [errorMessage, setErrorMessage] = useState("");
+  const [telemetry, setTelemetry] = useState<CameraTelemetry | null>(null);
+  const [hasVideo, setHasVideo] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+
+  const disconnect = useCallback(() => {
+    callRef.current?.close();
+    connectionRef.current?.close();
+    peerRef.current?.destroy();
+    callRef.current = null;
+    connectionRef.current = null;
+    peerRef.current = null;
+    const video = videoRef.current;
+    if (video?.srcObject) {
+      video.srcObject = null;
+    }
+    setHasVideo(false);
+  }, []);
+
+  useEffect(() => disconnect, [disconnect]);
+
+  const joinRoom = useCallback(async () => {
+    const code = cleanRoomCode(roomCode);
+    setRoomCode(code);
+    if (code.length !== ROOM_CODE_LENGTH) {
+      setErrorMessage("กรอกรหัสห้องให้ครบ 6 ตัว");
+      return;
+    }
+
+    disconnect();
+    setTelemetry(null);
+    setErrorMessage("");
+    setRoomState("connecting");
+    try {
+      const { Peer: RoomPeer } = await import("peerjs");
+      const peer = new RoomPeer(
+        `roadguard-monitor-${createRoomCode().toLowerCase()}-${Date.now().toString(36)}`,
+        { debug: 1 },
+      );
+      peerRef.current = peer;
+
+      peer.on("call", (call) => {
+        callRef.current?.close();
+        callRef.current = call;
+        call.answer();
+        call.on("stream", (stream) => {
+          const video = videoRef.current;
+          if (!video) return;
+          video.srcObject = stream;
+          void video.play().then(
+            () => setHasVideo(true),
+            () => setHasVideo(true),
+          );
+        });
+        call.on("close", () => setHasVideo(false));
+      });
+
+      peer.on("open", () => {
+        const connection = peer.connect(roomPeerId(code), {
+          reliable: true,
+        });
+        connectionRef.current = connection;
+        connection.on("open", () => {
+          setRoomState("ready");
+          connection.send({ type: "hello", protocol: 1 });
+        });
+        connection.on("data", (message) => {
+          if (isCameraTelemetry(message)) setTelemetry(message);
+        });
+        connection.on("close", () => {
+          setRoomState("error");
+          setErrorMessage("เครื่องกล้องออกจากห้องแล้ว");
+          setHasVideo(false);
+        });
+        connection.on("error", (error) => {
+          setRoomState("error");
+          setErrorMessage(peerErrorMessage(error));
+        });
+      });
+      peer.on("error", (error) => {
+        setRoomState("error");
+        setErrorMessage(peerErrorMessage(error));
+      });
+      peer.on("disconnected", () => {
+        if (!peer.destroyed) peer.reconnect();
+      });
+    } catch (error) {
+      console.error("Monitor room setup failed", error);
+      setRoomState("error");
+      setErrorMessage("เปิดระบบ P2P ไม่สำเร็จ กรุณาโหลดหน้าใหม่แล้วลองอีกครั้ง");
+    }
+  }, [disconnect, roomCode]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !telemetry) return;
+    const width = Math.max(1, telemetry.frameWidth);
+    const height = Math.max(1, telemetry.frameHeight);
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+    renderVisionOverlay(
+      canvas,
+      telemetry.mode,
+      performance.now(),
+      telemetry.detections,
+      telemetry.alert,
+      telemetry.roadScene,
+      width,
+      height,
+    );
+  }, [telemetry]);
+
+  const sendControl = useCallback((message: CameraControl) => {
+    const connection = connectionRef.current;
+    if (!connection?.open) return;
+    connection.send(message);
+  }, []);
+
+  const connected = roomState === "ready";
+  const currentMode = telemetry ? MODES[telemetry.mode] : MODES.drive;
+
+  return (
+    <main
+      className={`app-shell monitor-shell ${hasVideo ? "is-live" : ""}`}
+      data-alert={telemetry?.alert?.level ?? "none"}
+      style={{ "--mode-accent": currentMode.accent } as React.CSSProperties}
+    >
+      <div className="ambient" aria-hidden="true">
+        <div className="ambient-orb ambient-orb-one" />
+        <div className="ambient-orb ambient-orb-two" />
+        <div className="road-grid" />
+      </div>
+      <video
+        ref={videoRef}
+        className="camera-feed"
+        autoPlay
+        muted
+        playsInline
+        aria-label="ภาพสดจากเครื่องกล้อง RoadGuard"
+      />
+      <canvas
+        ref={canvasRef}
+        className="vision-layer"
+        aria-label="ผลตรวจจับที่ส่งจากเครื่องกล้อง"
+      />
+      <div className="camera-vignette" aria-hidden="true" />
+
+      <header className="top-bar monitor-top-bar">
+        <button className="back-button" type="button" onClick={onBack} aria-label="กลับ">
+          <ArrowLeft size={21} />
+        </button>
+        <div className="brand monitor-brand">
+          <span className="brand-mark"><Monitor size={19} /></span>
+          <span><strong>RoadGuard Monitor</strong><small>{connected ? `ห้อง ${roomCode}` : "P2P VIEWER"}</small></span>
+        </div>
+        <div className={`live-status model-${connected ? "ready" : "idle"}`}>
+          <span className="status-dot" />
+          {connected ? "เชื่อมแล้ว" : roomState === "connecting" ? "กำลังเชื่อม…" : "ยังไม่เชื่อม"}
+        </div>
+      </header>
+
+      {!connected && (
+        <section className="monitor-join-panel">
+          <span className="join-icon"><Radio size={29} /></span>
+          <h1>เข้าห้องกล้อง</h1>
+          <p>กรอกรหัส 6 ตัวที่แสดงบนเครื่องกล้อง</p>
+          <label htmlFor="room-code">รหัสห้อง</label>
+          <input
+            id="room-code"
+            type="text"
+            value={roomCode}
+            onChange={(event) => setRoomCode(cleanRoomCode(event.target.value))}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void joinRoom();
+            }}
+            autoCapitalize="characters"
+            autoComplete="off"
+            spellCheck={false}
+            inputMode="text"
+            maxLength={ROOM_CODE_LENGTH}
+            placeholder="เช่น 7K4M9P"
+            aria-describedby="room-help"
+          />
+          <small id="room-help">ต่อ Wi‑Fi หรือ hotspot เดียวกับเครื่องกล้องก่อน</small>
+          <button
+            className="start-button"
+            type="button"
+            onClick={() => void joinRoom()}
+            disabled={roomState === "connecting"}
+          >
+            {roomState === "connecting" ? <LoaderCircle className="spin" size={21} /> : <Wifi size={21} />}
+            {roomState === "connecting" ? "กำลังเชื่อมต่อ…" : "เชื่อมต่อเครื่องกล้อง"}
+          </button>
+          {errorMessage && <p className="error-message" role="alert">{errorMessage}</p>}
+        </section>
+      )}
+
+      {connected && telemetry && (
+        <>
+          <div className="monitor-stats" role="status">
+            <span><Navigation size={14} /> {telemetry.gpsLabel}</span>
+            <span><Radio size={14} /> สด</span>
+            <span><Users size={14} /> {telemetry.viewers}</span>
+          </div>
+          {telemetry.alert && (
+            <div className={`hazard-alert is-${telemetry.alert.level}`} role="alert">
+              <span className="hazard-icon"><AlertTriangle size={25} strokeWidth={2.4} /></span>
+              <span className="hazard-copy"><strong>{telemetry.alert.title}</strong><small>{telemetry.alert.detail}</small></span>
+            </div>
+          )}
+          {!hasVideo && (
+            <div className="waiting-video" role="status">
+              <LoaderCircle className="spin" size={24} />
+              รอเครื่องกล้องเริ่มส่งภาพ…
+            </div>
+          )}
+          <div className="monitor-bottom-bar">
+            <div>
+              <ModeIcon mode={telemetry.mode} size={19} />
+              <span><strong>{MODES[telemetry.mode].label}</strong><small>พบ {telemetry.detectedCount} วัตถุ • AI {telemetry.inferenceFps ? telemetry.inferenceFps.toFixed(1) : "—"} FPS</small></span>
+            </div>
+            <button type="button" onClick={() => setShowSettings(true)} aria-label="ตั้งค่าเครื่องกล้อง">
+              <Settings2 size={22} />
+            </button>
+          </div>
+        </>
+      )}
+
+      {showSettings && telemetry && (
+        <div className="sheet-backdrop" role="presentation">
+          <section className="info-sheet remote-settings-sheet" role="dialog" aria-modal="true" aria-labelledby="remote-settings-title">
+            <button className="sheet-close" type="button" onClick={() => setShowSettings(false)} aria-label="ปิด"><X size={21} /></button>
+            <span className="sheet-icon"><Settings2 size={28} /></span>
+            <h2 id="remote-settings-title">ตั้งค่าเครื่องกล้อง</h2>
+            <p>คำสั่งจะส่งตรงไปยังเครื่องกล้องในห้องนี้</p>
+            <h3>โหมดเดินทาง</h3>
+            <div className="remote-mode-options">
+              {Object.entries(MODES).map(([key, item]) => (
+                <button
+                  key={key}
+                  type="button"
+                  className={telemetry.mode === key ? "is-active" : ""}
+                  onClick={() => sendControl({ type: "control", action: "mode", value: key as TravelMode })}
+                >
+                  <ModeIcon mode={key as TravelMode} size={19} /> {item.label}
+                </button>
+              ))}
+            </div>
+            <h3>ความลื่นไหล</h3>
+            <div className="frame-rate-options">
+              {FRAME_RATE_TARGETS.map((target) => (
+                <button
+                  key={target}
+                  type="button"
+                  className={telemetry.frameRateTarget === target ? "is-active" : ""}
+                  onClick={() => sendControl({ type: "control", action: "frameRate", value: target })}
+                ><strong>{target}</strong><span>FPS</span></button>
+              ))}
+            </div>
+            <button
+              className={`remote-sound-toggle ${telemetry.soundEnabled ? "is-active" : ""}`}
+              type="button"
+              onClick={() => sendControl({ type: "control", action: "sound", value: !telemetry.soundEnabled })}
+            >
+              {telemetry.soundEnabled ? <Volume2 size={20} /> : <VolumeX size={20} />}
+              เสียงเตือนที่เครื่องกล้อง {telemetry.soundEnabled ? "เปิด" : "ปิด"}
+            </button>
+            <button className="sheet-confirm" type="button" onClick={() => setShowSettings(false)}>เสร็จแล้ว</button>
+          </section>
+        </div>
+      )}
+    </main>
+  );
+}
+
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -539,7 +954,29 @@ export default function Home() {
     DEFAULT_RUNTIME_PROFILE,
   );
   const recoveryCheckedRef = useRef<boolean | null>(null);
+  const roomPeerRef = useRef<Peer | null>(null);
+  const roomConnectionsRef = useRef(new Map<string, DataConnection>());
+  const roomCallsRef = useRef(new Map<string, MediaConnection>());
+  const viewerCountRef = useRef(0);
+  const lastTelemetryRef = useRef<CameraTelemetry | null>(null);
+  const lastTelemetrySentAtRef = useRef(0);
+  const publishStreamRef = useRef<(stream: MediaStream) => void>(() => undefined);
+  const closeMediaCallsRef = useRef<() => void>(() => undefined);
+  const broadcastTelemetryRef = useRef<(message: CameraTelemetry) => void>(() => undefined);
+  const remoteStatsRef = useRef({
+    cameraFps: 0,
+    displayFps: 0,
+    inferenceFps: 0,
+    speedKmh: 0,
+    gpsState: "idle" as GpsState,
+  });
 
+  const [appRole, setAppRole] = useState<AppRole | null>(null);
+  const [roomCode, setRoomCode] = useState("");
+  const [roomState, setRoomState] = useState<RoomState>("idle");
+  const [roomError, setRoomError] = useState("");
+  const [viewerCount, setViewerCount] = useState(0);
+  const [roomCopied, setRoomCopied] = useState(false);
   const [mode, setMode] = useState<TravelMode>("drive");
   const [cameraState, setCameraState] = useState<CameraState>("idle");
   const [modelState, setModelState] = useState<ModelState>("idle");
@@ -564,6 +1001,16 @@ export default function Home() {
   const [gpsState, setGpsState] = useState<GpsState>("idle");
   const [speedKmh, setSpeedKmh] = useState(0);
   const [sessionChecked, setSessionChecked] = useState(false);
+
+  useEffect(() => {
+    remoteStatsRef.current = {
+      cameraFps,
+      displayFps,
+      inferenceFps: fps,
+      speedKmh,
+      gpsState,
+    };
+  }, [cameraFps, displayFps, fps, gpsState, speedKmh]);
 
   const currentMode = MODES[mode];
   const isRunning =
@@ -942,6 +1389,7 @@ export default function Home() {
     if (clearSession) clearVisionSession();
     if (animationRef.current) cancelAnimationFrame(animationRef.current);
     animationRef.current = null;
+    closeMediaCallsRef.current();
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     if (clearSession) activeDeviceIdRef.current = undefined;
@@ -1288,6 +1736,29 @@ export default function Home() {
               analysisDimensions.width,
               analysisDimensions.height,
             );
+            const remoteStats = remoteStatsRef.current;
+            broadcastTelemetryRef.current({
+              type: "telemetry",
+              sentAt: Date.now(),
+              mode: modeRef.current,
+              frameRateTarget: frameRateTargetRef.current,
+              soundEnabled: soundEnabledRef.current,
+              detectedCount: detectionsRef.current.length,
+              speedKmh: remoteStats.speedKmh,
+              gpsLabel: gpsReading(
+                remoteStats.gpsState,
+                remoteStats.speedKmh,
+              ),
+              cameraFps: remoteStats.cameraFps,
+              displayFps: remoteStats.displayFps,
+              inferenceFps: remoteStats.inferenceFps,
+              viewers: viewerCountRef.current,
+              frameWidth: analysisDimensions.width,
+              frameHeight: analysisDimensions.height,
+              detections: detectionsRef.current,
+              alert: alertRef.current,
+              roadScene: roadSceneRef.current,
+            });
             const displayStats = displayStatsRef.current;
             if (!displayStats.startedAt) {
               displayStats.startedAt = elapsed;
@@ -1396,6 +1867,7 @@ export default function Home() {
         if (!video) throw new Error("camera-view-missing");
         video.srcObject = stream;
         await video.play();
+        publishStreamRef.current(stream);
         startLocationTracking();
         await refreshCameraList();
         await requestWakeLock();
@@ -1575,6 +2047,168 @@ export default function Home() {
     [],
   );
 
+  useEffect(() => {
+    if (appRole !== "camera" || roomCode.length !== ROOM_CODE_LENGTH) {
+      return;
+    }
+
+    let disposed = false;
+    const connections = roomConnectionsRef.current;
+    const calls = roomCallsRef.current;
+
+    const updateViewerCount = () => {
+      const next = roomConnectionsRef.current.size;
+      viewerCountRef.current = next;
+      setViewerCount(next);
+    };
+
+    const closeCalls = () => {
+      calls.forEach((call) => call.close());
+      calls.clear();
+    };
+    closeMediaCallsRef.current = closeCalls;
+
+    void import("peerjs")
+      .then(({ Peer: RoomPeer }) => {
+        if (disposed) return;
+        const peer = new RoomPeer(roomPeerId(roomCode), { debug: 1 });
+        roomPeerRef.current = peer;
+
+        const callMonitor = (connection: DataConnection, stream: MediaStream) => {
+          if (!connection.open || peer.destroyed) return;
+          roomCallsRef.current.get(connection.peer)?.close();
+          const call = peer.call(connection.peer, stream, {
+            metadata: { roomCode, protocol: 1 },
+          });
+          if (!call) return;
+          roomCallsRef.current.set(connection.peer, call);
+          call.on("close", () => roomCallsRef.current.delete(connection.peer));
+          call.on("error", () => roomCallsRef.current.delete(connection.peer));
+        };
+
+        publishStreamRef.current = (stream) => {
+          roomConnectionsRef.current.forEach((connection) => {
+            callMonitor(connection, stream);
+          });
+        };
+
+        broadcastTelemetryRef.current = (message) => {
+          lastTelemetryRef.current = message;
+          const now = performance.now();
+          if (now - lastTelemetrySentAtRef.current < 90) return;
+          lastTelemetrySentAtRef.current = now;
+          roomConnectionsRef.current.forEach((connection) => {
+            if (!connection.open) return;
+            try {
+              connection.send(message);
+            } catch {
+              // A closing monitor is removed by its close event.
+            }
+          });
+        };
+
+        peer.on("open", () => {
+          if (disposed) return;
+          setRoomState("ready");
+          setRoomError("");
+        });
+        peer.on("connection", (connection) => {
+          connection.on("open", () => {
+            if (disposed) {
+              connection.close();
+              return;
+            }
+            roomConnectionsRef.current.set(connection.peer, connection);
+            updateViewerCount();
+            if (lastTelemetryRef.current) {
+              connection.send({
+                ...lastTelemetryRef.current,
+                sentAt: Date.now(),
+                viewers: viewerCountRef.current,
+              });
+            }
+            const stream = streamRef.current;
+            if (stream) callMonitor(connection, stream);
+          });
+          connection.on("data", (message) => {
+            if (!isCameraControl(message)) return;
+            if (message.action === "mode") {
+              changeMode(message.value);
+              return;
+            }
+            if (message.action === "frameRate") {
+              void applyFrameRateTarget(message.value);
+              return;
+            }
+            if (message.value && !soundEnabledRef.current) {
+              void unlockAudio();
+            }
+            soundEnabledRef.current = message.value;
+            setSoundEnabled(message.value);
+            if (!message.value) window.speechSynthesis?.cancel();
+          });
+          connection.on("close", () => {
+            roomConnectionsRef.current.delete(connection.peer);
+            roomCallsRef.current.get(connection.peer)?.close();
+            roomCallsRef.current.delete(connection.peer);
+            updateViewerCount();
+          });
+          connection.on("error", () => {
+            roomConnectionsRef.current.delete(connection.peer);
+            updateViewerCount();
+          });
+        });
+        peer.on("disconnected", () => {
+          if (!disposed && !peer.destroyed) peer.reconnect();
+        });
+        peer.on("error", (error) => {
+          if (disposed) return;
+          const type = peerErrorType(error);
+          if (type === "peer-unavailable" || type === "webrtc") return;
+          setRoomState("error");
+          setRoomError(peerErrorMessage(error));
+        });
+      })
+      .catch((error) => {
+        console.error("Camera room setup failed", error);
+        if (disposed) return;
+        setRoomState("error");
+        setRoomError("เปิดห้อง P2P ไม่สำเร็จ กรุณาโหลดหน้าใหม่แล้วลองอีกครั้ง");
+      });
+
+    return () => {
+      disposed = true;
+      publishStreamRef.current = () => undefined;
+      broadcastTelemetryRef.current = () => undefined;
+      closeMediaCallsRef.current = () => undefined;
+      closeCalls();
+      connections.forEach((connection) => connection.close());
+      connections.clear();
+      roomPeerRef.current?.destroy();
+      roomPeerRef.current = null;
+      viewerCountRef.current = 0;
+      lastTelemetryRef.current = null;
+      setViewerCount(0);
+    };
+  }, [appRole, applyFrameRateTarget, changeMode, roomCode, unlockAudio]);
+
+  const copyRoomCode = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(roomCode);
+      setRoomCopied(true);
+      window.setTimeout(() => setRoomCopied(false), 1600);
+    } catch {
+      setRoomCopied(false);
+    }
+  }, [roomCode]);
+
+  const regenerateRoomCode = useCallback(() => {
+    setRoomCopied(false);
+    setRoomState("connecting");
+    setRoomError("");
+    setRoomCode(createRoomCode());
+  }, []);
+
   const retryModel = useCallback(() => {
     const recoveryProfile = selectRuntimeProfile(
       true,
@@ -1714,6 +2348,7 @@ export default function Home() {
   }, [restoreCameraAfterVisibility, scheduleObstacleModelRelease]);
 
   useEffect(() => {
+    if (appRole !== "camera") return;
     const timer = window.setTimeout(() => {
       const stored = readResumableVisionSession();
       if (!stored) {
@@ -1748,7 +2383,7 @@ export default function Home() {
     }, 0);
 
     return () => window.clearTimeout(timer);
-  }, [startCamera]);
+  }, [appRole, startCamera]);
 
   useEffect(() => {
     const applyOrientation = () => {
@@ -1813,6 +2448,32 @@ export default function Home() {
     [stopCamera],
   );
 
+  const chooseRole = (role: AppRole) => {
+    setErrorMessage("");
+    setSessionChecked(false);
+    if (role === "camera") {
+      setRoomCode(createRoomCode());
+      setRoomState("connecting");
+    }
+    setAppRole(role);
+  };
+
+  const leaveCurrentRole = () => {
+    if (appRole === "camera") stopCamera();
+    setShowSettings(false);
+    setShowInfo(false);
+    setRoomError("");
+    setAppRole(null);
+  };
+
+  if (!appRole) {
+    return <RoleLanding onChoose={chooseRole} />;
+  }
+
+  if (appRole === "monitor") {
+    return <MonitorView onBack={leaveCurrentRole} />;
+  }
+
   const liveStatus =
     cameraState === "paused"
       ? "รอแตะเพื่อเปิดกล้องต่อ"
@@ -1825,16 +2486,7 @@ export default function Home() {
         : modelState === "error"
           ? "AI ไม่พร้อม"
           : "เตรียม AI";
-  const gpsLabel =
-    gpsState === "ready"
-      ? `${speedKmh} กม./ชม.`
-      : gpsState === "locating"
-        ? "กำลังหา GPS"
-        : gpsState === "denied"
-          ? "GPS ถูกปิด"
-          : gpsState === "unsupported"
-            ? "ไม่รองรับ GPS"
-            : "สัญญาณ GPS อ่อน";
+  const gpsLabel = gpsReading(gpsState, speedKmh);
 
   return (
     <main
@@ -1894,6 +2546,19 @@ export default function Home() {
         )}
       </header>
 
+      {isRunning && (
+        <button
+          className={`camera-room-chip room-${roomState}`}
+          type="button"
+          onClick={() => void copyRoomCode()}
+          aria-label={`คัดลอกรหัสห้อง ${roomCode}`}
+        >
+          {roomCopied ? <Check size={15} /> : <Radio size={15} />}
+          <span>{roomCode}</span>
+          <small><Users size={13} /> {viewerCount}</small>
+        </button>
+      )}
+
       {!sessionChecked && (
         <section className="welcome-panel boot-panel" role="status">
           <span className="loader-ring">
@@ -1906,6 +2571,9 @@ export default function Home() {
 
       {sessionChecked && !isRunning && (
         <section className="welcome-panel">
+          <button className="role-back-link" type="button" onClick={leaveCurrentRole}>
+            <ArrowLeft size={16} /> เลือกหน้าที่ใหม่
+          </button>
           <div className="eyebrow">
             <span className="eyebrow-dot" />
             AI ROAD AWARENESS
@@ -1919,6 +2587,26 @@ export default function Home() {
             ใช้กล้อง iPhone มองวัตถุด้านหน้า
             พร้อมตรวจเลนจริงและการแจ้งเตือนบนจอ
           </p>
+
+          <div className={`camera-room-card room-${roomState}`}>
+            <div>
+              <span className="room-label"><Radio size={14} /> รหัสห้อง P2P</span>
+              <strong>{roomCode || "------"}</strong>
+              <small>
+                {roomState === "ready"
+                  ? "พร้อมให้ Monitor เชื่อมต่อ"
+                  : roomState === "connecting"
+                    ? "กำลังเปิดห้อง…"
+                    : roomError || "ห้องยังไม่พร้อม"}
+              </small>
+            </div>
+            <button type="button" onClick={() => void copyRoomCode()} aria-label="คัดลอกรหัสห้อง">
+              {roomCopied ? <Check size={19} /> : <Copy size={19} />}
+            </button>
+            <button type="button" onClick={regenerateRoomCode} aria-label="สุ่มรหัสห้องใหม่">
+              <RefreshCw size={18} />
+            </button>
+          </div>
 
           <div className="mode-picker" aria-label="เลือกวิธีเดินทาง">
             {modeEntries.map(([key, item]) => (
@@ -1954,7 +2642,7 @@ export default function Home() {
           </button>
 
           <p className="download-note">
-            ระบบจะขอสิทธิ์กล้องและตำแหน่ง • ครั้งแรกแนะนำ Wi‑Fi
+            ระบบจะขอสิทธิ์กล้องและตำแหน่ง • ภาพส่งตรงแบบ P2P ไปยัง Monitor
           </p>
 
           {errorMessage && (
@@ -2258,10 +2946,11 @@ export default function Home() {
               <li>พื้นที่ใต้ขอบตัวรถที่ตรวจพบจะถูกตัดออก เพื่อลดการตรวจคอนโซลผิดเป็นวัตถุ</li>
               <li>เมื่อ Safari พักหรือโหลดหน้าใหม่ ระบบจะพยายามกลับมาใช้กล้องต่อและลดภาระเป็นโหมดกู้คืนอัตโนมัติ</li>
               <li>บน iPhone ใช้ แชร์ → เพิ่มไปยังหน้าจอโฮม เพื่อเปิดแบบเต็มจอ</li>
+              <li>โหมด Monitor ใช้รหัสห้อง 6 ตัว ผู้ที่ทราบรหัสสามารถดูภาพและปรับค่ากล้องได้ จึงไม่ควรแชร์รหัสนอกกลุ่ม</li>
             </ul>
             <div className="privacy-box">
               <ShieldCheck size={17} />
-              ภาพและข้อมูลตำแหน่งประมวลผลบนอุปกรณ์และไม่ถูกอัปโหลด
+              ภาพประมวลผลบนเครื่องกล้อง และส่งแบบเข้ารหัส P2P เฉพาะ Monitor ที่เข้าห้อง
             </div>
             <button
               className="sheet-confirm"

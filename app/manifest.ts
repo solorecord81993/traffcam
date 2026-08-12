@@ -5,7 +5,7 @@ export default function manifest(): MetadataRoute.Manifest {
     name: "RoadGuard AI",
     short_name: "RoadGuard",
     description:
-      "ผู้ช่วยมองวัตถุและเตือนความเสี่ยงระหว่างเดิน ขี่ และขับรถด้วย YOLO",
+      "ผู้ช่วยมองวัตถุและเตือนความเสี่ยง พร้อมส่งภาพและข้อมูลไปยัง Monitor แบบ P2P",
     start_url: "/",
     display: "standalone",
     background_color: "#070b10",
