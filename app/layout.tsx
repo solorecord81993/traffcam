@@ -4,7 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "RoadGuard AI — ผู้ช่วยเตือนสิ่งกีดขวาง",
   description:
-    "เว็บแอปกล้องบน iPhone ที่ตรวจสิ่งกีดขวางแบบเรียลไทม์และเตือนความเสี่ยงระหว่างเดิน ขี่ และขับรถ",
+    "เว็บแอปกล้องบน iPhone ที่ตรวจสิ่งกีดขวางแบบเรียลไทม์ พร้อมโหมด Monitor เชื่อมภาพและข้อมูลแบบ P2P",
   applicationName: "RoadGuard AI",
   appleWebApp: {
     capable: true,

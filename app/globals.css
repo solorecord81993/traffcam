@@ -1071,6 +1071,461 @@ button:focus-visible {
   line-height: 1.45;
 }
 
+.role-shell {
+  overflow-y: auto;
+}
+
+.role-panel {
+  position: relative;
+  z-index: 5;
+  display: grid;
+  width: min(calc(100% - 30px), 520px);
+  min-height: 100%;
+  align-content: center;
+  margin: 0 auto;
+  padding: max(96px, calc(env(safe-area-inset-top) + 80px)) 0 max(28px, env(safe-area-inset-bottom));
+  text-align: center;
+}
+
+.role-panel h1 {
+  margin: 0;
+  font-size: clamp(42px, 12vw, 68px);
+  font-weight: 680;
+  letter-spacing: -0.065em;
+  line-height: 0.98;
+}
+
+.role-panel h1 span {
+  color: #a7b2bd;
+  font-weight: 530;
+}
+
+.role-options {
+  display: grid;
+  gap: 10px;
+}
+
+.role-options > button {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  min-height: 92px;
+  align-items: center;
+  gap: 14px;
+  padding: 13px 16px 13px 13px;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.052);
+  color: #f4f9fc;
+  text-align: left;
+  cursor: pointer;
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+}
+
+.role-options > button:active {
+  transform: scale(0.985);
+}
+
+.role-options > button > span:nth-child(2) {
+  display: grid;
+  gap: 4px;
+}
+
+.role-options strong {
+  font-size: 16px;
+  letter-spacing: -0.02em;
+}
+
+.role-options small {
+  color: #8f9ca7;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.role-icon,
+.join-icon {
+  display: grid;
+  width: 58px;
+  height: 58px;
+  place-items: center;
+  border-radius: 19px;
+}
+
+.camera-role-icon,
+.join-icon {
+  color: #06110e;
+  background: linear-gradient(145deg, #9effdd, #4ce6b1);
+}
+
+.monitor-role-icon {
+  color: #061018;
+  background: linear-gradient(145deg, #a7ecff, #68d7f7);
+}
+
+.role-arrow {
+  color: #73808b;
+  font-size: 20px;
+}
+
+.hotspot-note {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 17px;
+  color: #73828e;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.hotspot-note svg {
+  flex: 0 0 auto;
+  color: #74f7c5;
+}
+
+.monitor-top-bar {
+  justify-content: flex-start;
+  gap: 10px;
+}
+
+.monitor-top-bar .live-status {
+  margin-left: auto;
+}
+
+.back-button {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: rgba(8, 14, 20, 0.7);
+  cursor: pointer;
+}
+
+.monitor-brand .brand-mark {
+  width: 39px;
+  height: 39px;
+  color: #061018;
+  background: linear-gradient(145deg, #a7ecff, #68d7f7);
+}
+
+.monitor-join-panel {
+  position: absolute;
+  z-index: 6;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  width: min(calc(100% - 34px), 410px);
+  justify-items: center;
+  transform: translate(-50%, -48%);
+  text-align: center;
+}
+
+.monitor-join-panel h1 {
+  margin: 18px 0 4px;
+  font-size: clamp(30px, 9vw, 46px);
+  letter-spacing: -0.055em;
+}
+
+.monitor-join-panel > p:not(.error-message) {
+  margin: 0 0 20px;
+  color: #98a6b2;
+  font-size: 13px;
+}
+
+.monitor-join-panel label {
+  width: 100%;
+  margin-bottom: 7px;
+  color: #9aa8b3;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-align: left;
+}
+
+.monitor-join-panel input {
+  width: 100%;
+  height: 72px;
+  border: 1px solid rgba(116, 247, 197, 0.32);
+  border-radius: 20px;
+  outline: 0;
+  background: rgba(5, 12, 17, 0.82);
+  color: #f7fffc;
+  font: 740 27px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.25em;
+  text-align: center;
+  text-transform: uppercase;
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+}
+
+.monitor-join-panel input:focus {
+  border-color: #74f7c5;
+  box-shadow: 0 0 0 4px rgba(116, 247, 197, 0.1);
+}
+
+.monitor-join-panel > small {
+  margin: 8px 0 18px;
+  color: #71808b;
+  font-size: 10px;
+}
+
+.monitor-stats {
+  position: absolute;
+  z-index: 8;
+  top: max(82px, calc(env(safe-area-inset-top) + 70px));
+  left: 50%;
+  display: flex;
+  gap: 6px;
+  transform: translateX(-50%);
+}
+
+.monitor-stats span {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 9px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  background: rgba(4, 10, 15, 0.66);
+  color: #d6e0e6;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+}
+
+.waiting-video {
+  position: absolute;
+  z-index: 7;
+  top: 50%;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 13px 16px;
+  transform: translate(-50%, -50%);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(5, 12, 17, 0.82);
+  color: #b8c4cc;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.monitor-bottom-bar {
+  position: absolute;
+  z-index: 9;
+  right: max(16px, env(safe-area-inset-right));
+  bottom: max(16px, env(safe-area-inset-bottom));
+  left: max(16px, env(safe-area-inset-left));
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 11px 10px 15px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 21px;
+  background: rgba(5, 12, 17, 0.74);
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
+}
+
+.monitor-bottom-bar > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  color: var(--mode-accent);
+}
+
+.monitor-bottom-bar > div > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.monitor-bottom-bar strong {
+  color: #f8fbfd;
+  font-size: 13px;
+}
+
+.monitor-bottom-bar small {
+  overflow: hidden;
+  color: #8d9aa5;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.monitor-bottom-bar > button {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 0;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.1);
+  cursor: pointer;
+}
+
+.role-back-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0 0 10px;
+  padding: 4px 8px;
+  border: 0;
+  background: transparent;
+  color: #7f8e99;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.camera-room-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 43px 43px;
+  width: min(100%, 410px);
+  align-items: center;
+  gap: 7px;
+  margin: -9px auto 13px;
+  padding: 10px 10px 10px 14px;
+  border: 1px solid rgba(116, 247, 197, 0.2);
+  border-radius: 18px;
+  background: rgba(5, 15, 18, 0.58);
+  text-align: left;
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+}
+
+.camera-room-card > div {
+  display: grid;
+  gap: 1px;
+}
+
+.room-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #8aa097;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+}
+
+.camera-room-card strong {
+  color: #b5ffe6;
+  font: 760 20px/1.25 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.14em;
+}
+
+.camera-room-card small {
+  color: #77878f;
+  font-size: 8px;
+}
+
+.camera-room-card.room-error {
+  border-color: rgba(255, 79, 100, 0.28);
+}
+
+.camera-room-card > button {
+  display: grid;
+  width: 43px;
+  height: 43px;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.065);
+  cursor: pointer;
+}
+
+.camera-room-chip {
+  position: absolute;
+  z-index: 9;
+  top: max(66px, calc(env(safe-area-inset-top) + 54px));
+  left: max(18px, env(safe-area-inset-left));
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid rgba(116, 247, 197, 0.22);
+  border-radius: 999px;
+  background: rgba(4, 12, 15, 0.68);
+  color: #a9ffe1;
+  cursor: pointer;
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+}
+
+.camera-room-chip span {
+  font: 720 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.12em;
+}
+
+.camera-room-chip small {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  color: #8f9ba4;
+  font-size: 9px;
+}
+
+.remote-settings-sheet h3 {
+  margin: 14px 0 7px;
+  color: #9aa8b3;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+
+.remote-mode-options {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 7px;
+}
+
+.remote-mode-options button {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.045);
+  color: #909da8;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.remote-mode-options button.is-active,
+.remote-sound-toggle.is-active {
+  border-color: rgba(116, 247, 197, 0.4);
+  background: rgba(116, 247, 197, 0.1);
+  color: #caffed;
+}
+
+.remote-sound-toggle {
+  display: flex;
+  width: 100%;
+  min-height: 48px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 12px 0 14px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.045);
+  color: #9ba8b2;
+  font-size: 11px;
+  cursor: pointer;
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);
@@ -1277,6 +1732,72 @@ button:focus-visible {
 
   .quick-modes button {
     padding: 0 6px;
+  }
+
+  .monitor-brand strong {
+    font-size: 12px;
+  }
+
+  .monitor-brand small {
+    font-size: 7px;
+  }
+
+  .monitor-top-bar {
+    gap: 7px;
+  }
+
+  .monitor-stats span {
+    padding: 0 7px;
+    font-size: 9px;
+  }
+}
+
+@media (max-height: 760px) and (orientation: portrait) {
+  .welcome-panel:not(.boot-panel) h1 {
+    font-size: 39px;
+  }
+
+  .welcome-panel:not(.boot-panel) .lead {
+    margin: 10px auto 13px;
+    line-height: 1.45;
+  }
+
+  .camera-room-card {
+    margin-bottom: 9px;
+    padding-top: 7px;
+    padding-bottom: 7px;
+  }
+
+  .mode-card {
+    min-height: 60px;
+  }
+
+  .mode-copy {
+    margin: 8px 0 10px;
+  }
+
+  .welcome-links .safety-link {
+    margin-top: 9px;
+  }
+
+  .download-note {
+    display: none;
+  }
+
+  .role-panel {
+    align-content: start;
+  }
+
+  .role-panel h1 {
+    font-size: 42px;
+  }
+
+  .role-panel .lead {
+    margin: 13px auto 16px;
+  }
+
+  .role-options > button {
+    min-height: 82px;
   }
 }
 
